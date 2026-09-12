@@ -20,7 +20,7 @@
       "*": "ask"
     },
     "external_directory": {
-      "*": "deny"
+      "*": "ask"
     }
   }
 }

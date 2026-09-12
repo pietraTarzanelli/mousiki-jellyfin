@@ -495,6 +495,7 @@ void App::submit_search() {
         std::string query = buf.substr(2);
         while (!query.empty() && query.front() == ' ') query.erase(query.begin());
         last_online_query_ = query;
+        online_breadcrumb_.clear();
         list_source_ = ListSource::Online;
         if (search_in_progress_.load()) {
             status_line_ = "still searching, hang on ...";
@@ -788,7 +789,25 @@ void App::launch_search_async(const std::string& query) {
 
     search_thread_ = std::thread([this, query]() {
         std::string err;
-        auto results = jellyfin_.search(query, 30, &err);
+        auto results = jellyfin_.search(query, 50, &err);
+        std::lock_guard<std::mutex> lk(search_mutex_);
+        pending_search_results_ = std::move(results);
+        pending_search_error_ = std::move(err);
+        search_ready_ = true;
+    });
+}
+
+void App::launch_browse_async(const std::string& item_id, const std::string& title) {
+    if (search_thread_.joinable()) search_thread_.join();
+    search_in_progress_ = true;
+    search_ready_ = false;
+    pending_search_error_.clear();
+    online_breadcrumb_ = title;
+    status_line_ = "loading \"" + title + "\" ...";
+
+    search_thread_ = std::thread([this, item_id]() {
+        std::string err;
+        auto results = jellyfin_.list_children(item_id, &err);
         std::lock_guard<std::mutex> lk(search_mutex_);
         pending_search_results_ = std::move(results);
         pending_search_error_ = std::move(err);
@@ -817,7 +836,11 @@ void App::poll_pending_search() {
     online_view_ = std::move(results);
     selected_ = 0;
     scroll_ = 0;
-    status_line_ = online_view_.empty() ? "no jellyfin results" : "";
+    if (online_breadcrumb_.empty()) {
+        status_line_ = online_view_.empty() ? "no jellyfin results" : "";
+    } else if (online_view_.empty()) {
+        status_line_ = "no tracks in \"" + online_breadcrumb_ + "\"";
+    }
 }
 
 void App::play_selected() {
@@ -895,6 +918,10 @@ void App::queue_add_selected() {
         queue_.push_back({true, t.title, t.folder_artist, t.path, ""});
     } else {
         const auto& r = online_view_[selected_];
+        if (r.type == "Album" || r.type == "Playlist") { // containers: Enter-equivalent drill-in, not queueable
+            start_online_track(r);
+            return;
+        }
         queue_.push_back({false, r.title, r.uploader, {}, r.video_id});
     }
     clamp_queue_selected();
@@ -1174,10 +1201,17 @@ void App::start_local_track(const LocalTrack& track) {
 }
 
 void App::start_online_track(const OnlineResult& result) {
+    // Album/playlist hits aren't audio — drill into their track list
+    // instead of trying to play them.
+    if (result.type == "Album" || result.type == "Playlist") {
+        if (search_in_progress_.load()) { status_line_ = "still loading, hang on ..."; return; }
+        launch_browse_async(result.video_id, result.title);
+        return;
+    }
     if (load_in_progress_.load()) { status_line_ = "still loading the previous track ..."; return; }
-    // Artist comes back in the resolve step (server metadata) — passing ""
-    // here keeps the call clean; the Jellyfin item id is the only thing
-    // that must ride through to the loader.
+    // Artist comes back in the resolve step (server metadata) — passing
+    // "" here keeps the call clean; the Jellyfin item id is the only
+    // thing that must ride through to the loader.
     launch_load_async({}, result.title, "", "jellyfin", /*is_local=*/false, result.video_id);
 }
 
@@ -1930,7 +1964,8 @@ std::vector<std::string> App::build_search_bar(int total_width) const {
 
 std::vector<std::string> App::build_list_panel(int total_width, int height) const {
     bool online = (list_source_ == ListSource::Online);
-    std::string label = online ? "JELLYFIN RESULTS"
+    std::string label = online ? (online_breadcrumb_.empty() ? "JELLYFIN RESULTS"
+                                                             : online_breadcrumb_)
                                 : "LOCAL AUDIO FILES (sort: " + std::string(sort_mode_name(local_sort_mode_)) + ")";
     size_t total = online ? online_view_.size() : local_view_.size();
     int inner = total_width - 4;
@@ -1951,7 +1986,8 @@ std::vector<std::string> App::build_list_panel(int total_width, int height) cons
                 int title_w = std::max(5, inner - idx_w - 2 - 2 - uploader_w);
                 std::string t_idx = apply_font_map(std::to_string(idx + 1), settings_.font_map);
                 std::string t_title = apply_font_map(r.title, settings_.font_map);
-                std::string t_uploader = apply_font_map(r.uploader, settings_.font_map);
+                std::string side = (r.type == "Album" || r.type == "Playlist") ? r.type : r.uploader;
+                std::string t_uploader = apply_font_map(side, settings_.font_map);
                 content = pad_right(t_idx, idx_w) + settings_.list_separator + " "
                         + pad_right(truncate_str(t_title, title_w), title_w) + settings_.list_separator + " "
                         + pad_right(truncate_str(t_uploader, uploader_w), uploader_w);

@@ -78,7 +78,7 @@ std::vector<OnlineResult> JellyfinSource::search(const std::string& query, int c
     }
 
     std::string url = base_url_ + "/Search/Hints?searchTerm=" + url_encode(query) +
-                      "&includeItemTypes=Audio&limit=" + std::to_string(count);
+                      "&includeItemTypes=Audio,Album,Playlist&limit=" + std::to_string(count);
     std::string body, err;
     if (!http_get_json(url, auth_header(), insecure_, body, err)) {
         if (error_out) *error_out = err;
@@ -97,13 +97,75 @@ std::vector<OnlineResult> JellyfinSource::search(const std::string& query, int c
     std::vector<OnlineResult> results;
     for (const auto& hint : hints->arr) {
         std::string type = sget(&hint, "Type");
-        std::string media = sget(&hint, "MediaType");
-        if (type != "Audio" && media != "Audio") continue; // skip artist/album hints
+        if (type != "Audio" && type != "Album" && type != "Playlist") continue; // skip artist/api/program hints
 
         OnlineResult item;
         item.video_id = sget(&hint, "Id");
         item.title = sget(&hint, "Name");
         item.uploader = artist_from_hint(hint);
+        item.type = type;
+        if (item.video_id.empty() || item.title.empty()) continue;
+        results.push_back(std::move(item));
+    }
+    return results;
+}
+
+// =====================================================================
+// Container browsing (album / playlist -> contained tracks)
+// =====================================================================
+
+std::string JellyfinSource::resolve_user_id() {
+    if (!user_id_.empty() || !configured()) return user_id_;
+
+    std::string url = base_url_ + "/Users";
+    std::string body, err;
+    if (!http_get_json(url, auth_header(), insecure_, body, err)) return {};
+
+    minijson::Value root;
+    if (!minijson::parse(body, root) || !root.is_array() || root.arr.empty()) return {};
+
+    user_id_ = root.arr[0].get("Id") ? root.arr[0].get("Id")->as_string() : std::string();
+    return user_id_;
+}
+
+std::vector<OnlineResult> JellyfinSource::list_children(const std::string& parent_id, std::string* error_out) {
+    if (!configured()) {
+        if (error_out) *error_out = "Jellyfin server not configured";
+        return {};
+    }
+    if (parent_id.empty()) {
+        if (error_out) *error_out = "empty item id";
+        return {};
+    }
+
+    std::string url = base_url_ + "/Items?ParentId=" + url_encode(parent_id) +
+                      "&IncludeItemTypes=Audio&Recursive=false";
+    std::string uid = resolve_user_id();
+    if (!uid.empty()) url += "&UserId=" + url_encode(uid);
+
+    std::string body, err;
+    if (!http_get_json(url, auth_header(), insecure_, body, err)) {
+        if (error_out) *error_out = err;
+        return {};
+    }
+
+    minijson::Value root;
+    if (!minijson::parse(body, root) || !root.is_object()) {
+        if (error_out) *error_out = "server returned unparseable item list";
+        return {};
+    }
+
+    const minijson::Value* items = root.get("Items");
+    if (!items || !items->is_array()) return {};
+
+    std::vector<OnlineResult> results;
+    for (const auto& it : items->arr) {
+        if (sget(&it, "Type") != "Audio") continue;
+        OnlineResult item;
+        item.video_id = sget(&it, "Id");
+        item.title = sget(&it, "Name");
+        item.uploader = artist_from_hint(it);
+        item.type = "Audio";
         if (item.video_id.empty() || item.title.empty()) continue;
         results.push_back(std::move(item));
     }

@@ -55,6 +55,7 @@ private:
     std::vector<LocalTrack> all_local_tracks_;
     std::vector<LocalTrack> local_view_;     // filtered
     std::vector<OnlineResult> online_view_;
+    std::string online_breadcrumb_; // when non-empty, online list is a container's tracks
     int selected_ = 0;
     int scroll_ = 0;
     std::string search_buffer_;
@@ -153,6 +154,7 @@ private:
     std::vector<OnlineResult> pending_search_results_;
     std::string pending_search_error_;
     void launch_search_async(const std::string& query);
+    void launch_browse_async(const std::string& item_id, const std::string& title);
     void poll_pending_search();
 
     // --- settings panel (5 tabs: Colors, On/Off, Animation, Reference, About App) ---
