@@ -58,6 +58,7 @@ private:
     int selected_ = 0;
     int scroll_ = 0;
     std::string search_buffer_;
+    size_t search_cursor_ = 0; // byte offset into search_buffer_ (always on a UTF-8 char boundary)
     std::string last_local_query_;
     ListSource pre_search_list_source_ = ListSource::Local;
     std::string pre_search_local_query_;

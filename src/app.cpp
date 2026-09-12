@@ -1,4 +1,5 @@
 #include "app.h"
+#include "utf8_util.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -1204,13 +1205,35 @@ void App::handle_key(int key) {
             return;
         }
         if (key == '\r' || key == '\n') { submit_search(); mode_ = Mode::Browse; return; }
-        if (key == 127 || key == 8) {
-            if (!search_buffer_.empty()) search_buffer_.pop_back();
+        if (key == 127 || key == 8) { // backspace deletes the char before the cursor
+            if (!search_buffer_.empty() && search_cursor_ > 0) {
+                size_t p = search_cursor_;
+                size_t chop = 0;
+                do { --p; ++chop; }
+                while (p > 0 && (static_cast<unsigned char>(search_buffer_[p - 1]) & 0xC0) == 0x80);
+                search_buffer_.erase(p, chop);
+                search_cursor_ = p;
+            }
             update_live_search_preview();
             return;
         }
+        if (key == 'D') { // left arrow — cursor back one char
+            if (search_cursor_ > 0) {
+                size_t p = search_cursor_ - 1;
+                while (p > 0 && (static_cast<unsigned char>(search_buffer_[p]) & 0xC0) == 0x80) --p;
+                search_cursor_ = p;
+            }
+            return;
+        }
+        if (key == 'C') { // right arrow — cursor forward one char
+            if (search_cursor_ < search_buffer_.size()) {
+                search_cursor_ += static_cast<size_t>(utf8_seq_len(static_cast<unsigned char>(search_buffer_[search_cursor_])));
+            }
+            return;
+        }
         if (key >= 32 && key < 127) {
-            search_buffer_ += static_cast<char>(key);
+            search_buffer_.insert(std::min(search_cursor_, search_buffer_.size()), 1, static_cast<char>(key));
+            search_cursor_ = std::min(search_cursor_ + 1, search_buffer_.size());
             update_live_search_preview();
             return;
         }
@@ -1358,6 +1381,7 @@ void App::handle_key(int key) {
         case '/':
             mode_ = Mode::Search;
             search_buffer_.clear();
+            search_cursor_ = 0;
             pre_search_list_source_ = list_source_;
             pre_search_local_query_ = last_local_query_;
             break;
@@ -1886,7 +1910,8 @@ std::vector<std::string> App::build_search_bar(int total_width) const {
 
     std::string content;
     if (mode_ == Mode::Search) {
-        content = "/" + search_buffer_ + "\u2588"; // block cursor
+        size_t cur = std::min(search_cursor_, search_buffer_.size());
+        content = "/" + search_buffer_.substr(0, cur) + "\u2588" + search_buffer_.substr(cur);
     } else if (list_source_ == ListSource::Online) {
         content = "/s:" + last_online_query_;
     } else {
