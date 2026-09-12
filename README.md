@@ -18,8 +18,8 @@ I created Mousiki because I wanted a fast, focused TUI (Terminal User Interface)
 ## ✨ Features
 
 - **Local Music Playback:** Instantly browse and play your local music files.
-- **Online Search & Streaming:** Search and stream tracks directly from online sources.
-- **Synced Lyrics:** Real-time, word-by-word active lyrics highlighting as the song plays.
+- **Jellyfin Streaming:** Search and stream tracks straight from your Jellyfin media server via its native REST API (no yt-dlp, no Subsonic).
+- **Synced Lyrics:** Real-time, word-by-word active lyrics highlighting fetched from your Jellyfin server with local `.lrc` sidecar caching.
 - **Visualizers:** Real-time FFT spectrum, waveform rendering, and spinning disk art.
 - **Queue Management:** Effortless queueing, shuffling, and repeating.
 - **Highly Configurable:** Tweak colors, visualizer fluidity, animations, and hotkeys to match your exact workflow.
@@ -39,8 +39,8 @@ Configurable in `$HOME/.config/mousiki/config.txt`.
 | Action | Keybinding | Description |
 | :--- | :--- | :--- |
 | **Local Search** | `/` | Filter and search local library |
-| **Online Stream Search** | `/s: <query>` | Search and stream music online |
-| **Download Stream** | `y` | Download currently streaming track |
+| **Jellyfin Search** | `/s: <query>` | Search and stream music from your Jellyfin library |
+| **Download Stream** | `y` | Save the currently streaming track into your music folder |
 | **Play / Pause** | `p` (or `ENTER`) | Toggle playback |
 | **Next / Previous Track** | `n` / `b` | Skip between songs |
 | **Seek** | `ARROW_LEFT` / `ARROW_RIGHT` | Seek backward / forward |
@@ -61,7 +61,7 @@ Configurable in `$HOME/.config/mousiki/config.txt`.
 
 ### Prerequisites & Installation
 
-Mousiki relies on a few external tools for audio fetching, decoding, and lyrics. The easiest way to get started is by running the setup script on macOS (requires [Homebrew](https://brew.sh)), Debian-based Linux, or Termux:
+Mousiki relies on `ffmpeg` for decoding and `curl` for talking to your Jellyfin server. The easiest way to get started is by running the setup script on macOS (requires [Homebrew](https://brew.sh)), Debian-based Linux, or Termux:
 
 ```bash
 # Clone the repository
@@ -72,7 +72,7 @@ cd mousiki
 bash setup.sh
 ```
 
-If you're building manually, ensure you have `cmake`, a C++17 compiler, `ffmpeg`, `yt-dlp`, and the Python `syncedlyrics` package installed.
+If you're building manually, ensure you have `cmake`, a C++17 compiler, `ffmpeg`, and `curl` installed.
 
 ### Running the App
 
@@ -94,15 +94,32 @@ LocalMusicPath=/custom/path
 LocalMusicPath=/home/user/Music
 ```
 
+### Connecting to Your Jellyfin Server
+
+Streaming and lyrics come from your Jellyfin server's native REST API. Add these to `$HOME/.config/mousiki/config.txt`:
+
+```ini
+# The base URL of your Jellyfin server
+JellyfinServerUrl=http://your-server:8096
+
+# A token from Jellyfin Dashboard -> API Keys
+JellyfinApiKey=your-generated-api-key
+
+# Set to false if your server has a proper https cert
+JellyfinSkipCertCheck=true
+```
+
+Press `/`, type `s: <query>`, and Enter to search the Jellyfin library. Track audio is downloaded on demand and cached locally; press `y` to save the current track into your music folder. Lyrics fetched from the server are stored as `.lrc` files next to the (cached or saved) audio, so previously-fetched tracks show lyrics even when the server is unreachable.
+
 ## 🙏 Attribution & Dependencies
 
 Mousiki stands on the shoulders of giants. A huge thank you to the developers behind these awesome open-source projects that make Mousiki tick:
 
 - **[miniaudio](https://github.com/mackron/miniaudio):** An incredible single-file audio playback and capture library.
 - **[kissfft](https://github.com/mborgerding/kissfft):** A wonderfully simple and lightweight real-input FFT library (powering the spectrum visualizer).
-- **[yt-dlp](https://github.com/yt-dlp/yt-dlp):** The backend magic for our online search and streaming capabilities.
-- **[syncedlyrics](https://github.com/rtcq/syncedlyrics):** Python package fetching the synced lyrics data.
+- **[Jellyfin](https://jellyfin.org/):** The open-source media server we stream from and pull synced lyrics from.
 - **[FFmpeg](https://ffmpeg.org/):** The Swiss army knife of multimedia handling.
+- **[curl](https://curl.se/):** Transfers used to talk to the Jellyfin API.
 
 ## 📜 License
 

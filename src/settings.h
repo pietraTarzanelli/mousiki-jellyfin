@@ -135,6 +135,15 @@ struct Settings {
     // (~/Music and ~/disk/Music).
     std::vector<std::string> local_music_paths;
 
+    // --- Jellyfin server (config.txt) --------------------------------
+    // The app's "online" source. Server URL + a dashboard-generated API key;
+    // both are file-only config (a server URL is far too long for the
+    // settings panel's 18-char text field). When empty, /s: search reports
+    // "not configured" rather than erroring.
+    std::string jellyfin_server_url;
+    std::string jellyfin_api_key;
+    bool jellyfin_skip_cert_check = true; // curl --insecure: self-signed LAN certs
+
     // --- hotkey mapping ------------------------------------------------
     // Action name → key string (e.g. "ARROW_KEY_UP", "s", "ENTER")
     std::unordered_map<std::string, std::string> hotkeys;

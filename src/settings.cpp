@@ -619,6 +619,11 @@ static Settings load_from_config(const fs::path& path) {
             continue;
         }
 
+        // --- Jellyfin server ---
+        if (key == "JellyfinServerUrl") { s.jellyfin_server_url = trim(unquote(value)); continue; }
+        if (key == "JellyfinApiKey") { s.jellyfin_api_key = trim(unquote(value)); continue; }
+        if (key == "JellyfinSkipCertCheck") { s.jellyfin_skip_cert_check = parse_bool(value); continue; }
+
         // --- Hotkeys ---
         if (key.substr(0, 4) == "HKEY" || key.substr(0, 4) == "KHEY" || key.substr(0, 4) == "HKey") {
             s.hotkeys[key] = unquote(value);
@@ -823,6 +828,12 @@ void save_settings(const Settings& s) {
     for (const auto& path : s.local_music_paths) {
         out << "LocalMusicPath=" << path << "\n";
     }
+    out << "\n# Jellyfin Server\n";
+    out << "# Native Jellyfin REST API (no Subsonic, no plugins). API key from\n";
+    out << "# Dashboard -> API Keys. Getting the key: generate once, paste below.\n";
+    out << "JellyfinServerUrl=" << s.jellyfin_server_url << "\n";
+    out << "JellyfinApiKey=" << s.jellyfin_api_key << "\n";
+    out << "JellyfinSkipCertCheck=" << tf(s.jellyfin_skip_cert_check) << "\n";
     out << "\n# Navigation\n";
     // Write every mapped hotkey, stable order, whatever the key is named.
     static const char* hkey_order[] = {

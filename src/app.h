@@ -8,21 +8,20 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache_manager.h"
 #include "disk_art.h"
 #include "fft_visualizer.h"
+#include "jellyfin_source.h"
 #include "local_source.h"
 #include "lyrics_fetcher.h"
 #include "metadata_probe.h"
 #include "native_duration.h"
-#include "online_source.h"
 #include "player.h"
 #include "settings.h"
 #include "sphere_visualizer.h"
 #include "streaming_pcm.h"
 #include "terminal_ui.h"
 #include "waveform.h"
-#include "youtube_source.h"
-#include "cache_manager.h"
 
 namespace muisc {
 
@@ -45,12 +44,10 @@ public:
 private:
     // --- infrastructure ---
     CacheManager cache_;
-    YoutubeSource youtube_{cache_};
-    OnlineSource online_;
+    JellyfinSource jellyfin_{cache_};
     LocalSource local_source_;
     DiskArt disk_;
     mutable Player player_;
-    fs::path lyrics_script_;
 
     // --- lists / navigation ---
     Mode mode_ = Mode::Browse;
@@ -83,6 +80,7 @@ private:
     bool has_track_ = false;
     fs::path current_path_;
     TrackMetadata metadata_;
+    std::string current_jellyfin_id_; // item id of the loaded Jellyfin track ("" = local)
     std::vector<float> waveform_envelope_;
     std::chrono::steady_clock::time_point waveform_reveal_start_;
     bool waveform_ready_ = false;
@@ -102,7 +100,8 @@ private:
     mutable LyricsResult lyrics_result_;
     std::atomic<bool> lyrics_ready_{false};
     std::atomic<int> lyrics_epoch_{0};
-    void launch_lyrics_fetch(std::string title, std::string artist, fs::path path, bool force_network = false);
+    void launch_lyrics_fetch(std::string title, std::string artist, fs::path path,
+                             std::string jellyfin_item_id = "");
 
     std::string status_line_;
     bool quit_ = false;
@@ -114,6 +113,7 @@ private:
     struct PendingLoad {
         bool success = false;
         std::string title, artist, location_label, error;
+        std::string jellyfin_id;   // item id, for Jellyfin-provided lyrics
         fs::path path;
         std::shared_ptr<StreamingPcm> pcm;
         size_t total_sec = 0;
@@ -150,6 +150,7 @@ private:
     std::atomic<bool> search_ready_{false};
     std::atomic<bool> search_in_progress_{false};
     std::vector<OnlineResult> pending_search_results_;
+    std::string pending_search_error_;
     void launch_search_async(const std::string& query);
     void poll_pending_search();
 

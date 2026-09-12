@@ -67,6 +67,14 @@ if ! print_dep "ffmpeg" "ffmpeg"; then
     MISSING+=("ffmpeg")
 fi
 
+if ! print_dep "curl" "curl"; then
+    MISSING+=("curl")
+fi
+
+if ! print_dep "cmake" "cmake"; then
+    MISSING+=("cmake")
+fi
+
 if [ "$IS_TERMUX" = true ]; then
     if ! print_dep "clang" "clang"; then
         MISSING+=("clang")
@@ -75,82 +83,10 @@ if [ "$IS_TERMUX" = true ]; then
     if ! print_dep "make" "make"; then
         MISSING+=("make")
     fi
-
-    if ! print_dep "python" "python"; then
-        MISSING+=("python")
-    fi
-
-    PYTHON_CMD="python"
-
 else
     if ! print_dep "make" "make"; then
         MISSING+=("make")
     fi
-
-    if ! print_dep "python" "python3"; then
-        MISSING+=("python3")
-    fi
-
-    PYTHON_CMD="python3"
-fi
-
-if ! print_dep "yt-dlp" "yt-dlp"; then
-    MISSING+=("yt-dlp")
-fi
-
-if ! print_dep "cmake" "cmake"; then
-    MISSING+=("cmake")
-fi
-
-# -------------------------------
-# Python package manager
-# -------------------------------
-
-PIP_PATH="$(command -v pip 2>/dev/null || true)"
-PIPX_PATH="$(command -v pipx 2>/dev/null || true)"
-
-if [[ "$PIPX_PATH" == /usr/* ]]; then
-    PIP_MANAGER="pipx"
-    PIP_MANAGER_PATH="$PIPX_PATH"
-elif [[ "$PIP_PATH" == /usr/* ]]; then
-    PIP_MANAGER="pip"
-    PIP_MANAGER_PATH="$PIP_PATH"
-elif [ -n "$PIPX_PATH" ]; then
-    PIP_MANAGER="pipx"
-    PIP_MANAGER_PATH="$PIPX_PATH"
-elif [ -n "$PIP_PATH" ]; then
-    PIP_MANAGER="pip"
-    PIP_MANAGER_PATH="$PIP_PATH"
-else
-    echo "Error: neither pip nor pipx is installed."
-    exit 1
-fi
-
-echo "Python package manager: $PIP_MANAGER"
-echo "  $PIP_MANAGER_PATH"
-
-# -------------------------------
-# Python dependency
-# -------------------------------
-
-if [ "$PIP_MANAGER" = "pip" ]; then
-
-    if "$PYTHON_CMD" -c "import syncedlyrics" >/dev/null 2>&1; then
-        printf "%-14s ✓\n" "syncedlyrics"
-    else
-        printf "%-14s ✗\n" "syncedlyrics"
-        MISSING+=("syncedlyrics")
-    fi
-
-elif [ "$PIP_MANAGER" = "pipx" ]; then
-
-    if "$PIP_MANAGER_PATH" list 2>/dev/null | grep -q '^syncedlyrics '; then
-        printf "%-14s ✓\n" "syncedlyrics"
-    else
-        printf "%-14s ✗\n" "syncedlyrics"
-        MISSING+=("syncedlyrics")
-    fi
-
 fi
 
 # -------------------------------
@@ -179,20 +115,7 @@ if [ ${#MISSING[@]} -gt 0 ]; then
 
         echo "==> Installing missing macOS dependencies..."
 
-        BREW_DEPS=()
-
-        for dep in "${MISSING[@]}"; do
-            case "$dep" in
-                python3)
-                    BREW_DEPS+=("python3")
-                    ;;
-                *)
-                    BREW_DEPS+=("$dep")
-                    ;;
-            esac
-        done
-
-        HOMEBREW_NO_AUTO_UPDATE=1 brew install "${BREW_DEPS[@]}"
+        HOMEBREW_NO_AUTO_UPDATE=1 brew install "${MISSING[@]}"
 
     elif [ "$OS" = "Linux" ]; then
 
@@ -205,9 +128,7 @@ if [ ${#MISSING[@]} -gt 0 ]; then
                 cmake \
                 build-essential \
                 ffmpeg \
-                yt-dlp \
-                python3 \
-                python3-pip
+                curl
 
         elif check_command pacman; then
 
@@ -217,9 +138,7 @@ if [ ${#MISSING[@]} -gt 0 ]; then
                 cmake \
                 base-devel \
                 ffmpeg \
-                yt-dlp \
-                python \
-                python-pip
+                curl
 
         elif check_command dnf; then
 
@@ -230,9 +149,7 @@ if [ ${#MISSING[@]} -gt 0 ]; then
                 gcc-c++ \
                 make \
                 ffmpeg \
-                yt-dlp \
-                python3 \
-                python3-pip
+                curl
 
         else
             echo "Error: Unsupported Linux package manager."
@@ -242,31 +159,13 @@ if [ ${#MISSING[@]} -gt 0 ]; then
 fi
 
 # -------------------------------
-# Install Python dependencies
-# -------------------------------
-
-if [[ " ${MISSING[*]} " == *" syncedlyrics "* ]]; then
-
-    echo ""
-    echo "==> Installing syncedlyrics..."
-
-    if [ "$PIP_MANAGER" = "pip" ]; then
-        "$PYTHON_CMD" -m pip install syncedlyrics
-
-    elif [ "$PIP_MANAGER" = "pipx" ]; then
-        "$PIP_MANAGER_PATH" install syncedlyrics
-    fi
-
-fi
-
-# -------------------------------
 # Verify dependencies again
 # -------------------------------
 
 echo ""
 echo "======== Verifying deps ========="
 
-for cmd in cmake ffmpeg yt-dlp "$PYTHON_CMD"; do
+for cmd in cmake ffmpeg curl; do
     if ! check_command "$cmd"; then
         echo "Error: $cmd is still missing."
         exit 1
@@ -276,22 +175,6 @@ done
 if [ "$IS_TERMUX" = true ] && ! check_command clang; then
     echo "Error: clang is still missing."
     exit 1
-fi
-
-if [ "$PIP_MANAGER" = "pip" ]; then
-
-    if ! "$PYTHON_CMD" -c "import syncedlyrics" >/dev/null 2>&1; then
-        echo "Error: syncedlyrics is not installed correctly."
-        exit 1
-    fi
-
-elif [ "$PIP_MANAGER" = "pipx" ]; then
-
-    if ! "$PIP_MANAGER_PATH" list 2>/dev/null | grep -q '^syncedlyrics '; then
-        echo "Error: syncedlyrics is not installed correctly."
-        exit 1
-    fi
-
 fi
 
 echo "All dependencies are ready."
@@ -309,25 +192,15 @@ mkdir -p "$CONFIG_DIR"
 if [ ! -f "$CONFIG_DIR/config.txt" ]; then
     cp config.txt "$CONFIG_DIR/config.txt"
     echo "Created $CONFIG_DIR/config.txt"
+    echo ""
+    echo "Open $CONFIG_DIR/config.txt and fill in:"
+    echo "  JellyfinServerUrl=http://your-server:8096"
+    echo "  JellyfinApiKey=<key from Dashboard -> API Keys>"
+    echo ""
 else
     echo "Existing config found. Keeping current file."
-fi
-
-YTDLP_CONFIG_DIR="$HOME/.config/yt-dlp"
-mkdir -p "$YTDLP_CONFIG_DIR"
-
-if [ ! -f "$YTDLP_CONFIG_DIR/config" ]; then
-    echo '--extractor-args "youtube:player_client=android"' \
-        > "$YTDLP_CONFIG_DIR/config"
-
-    echo "Configured yt-dlp."
-elif ! grep -q "player_client" "$YTDLP_CONFIG_DIR/config"; then
-    echo '--extractor-args "youtube:player_client=android"' \
-        >> "$YTDLP_CONFIG_DIR/config"
-
-    echo "Updated yt-dlp configuration."
-else
-    echo "yt-dlp configuration already exists."
+    echo "If your config has no JellyfinServerUrl/JellyfinApiKey yet,"
+    echo "add them to $CONFIG_DIR/config.txt"
 fi
 
 # -------------------------------

@@ -9,10 +9,6 @@
 #include <random>
 #include <sstream>
 #include <thread>
-#include <unistd.h>
-#if defined(__APPLE__)
-#include <mach-o/dyld.h>
-#endif
 
 namespace muisc {
 
@@ -332,47 +328,12 @@ std::vector<std::string> render_lyric_line_wrapped(const LyricLine& line, double
     return out;
 }
 
-fs::path find_lyrics_script() {
-    if (const char* env = std::getenv("MOUSIKI_SCRIPTS_DIR")) {
-        fs::path p = fs::path(env) / "fetch_lyrics.py";
-        if (fs::exists(p)) return p;
-    }
-    fs::path cwd_candidate = fs::path("scripts") / "fetch_lyrics.py";
-    if (fs::exists(cwd_candidate)) return cwd_candidate;
-
-#if defined(__APPLE__)
-    char exe_buf[4096];
-    uint32_t size = sizeof(exe_buf);
-    if (_NSGetExecutablePath(exe_buf, &size) == 0) {
-        std::error_code ec;
-        fs::path exe_dir = fs::canonical(fs::path(exe_buf), ec).parent_path();
-        if (!ec) {
-            fs::path p = exe_dir / "scripts" / "fetch_lyrics.py";
-            if (fs::exists(p)) return p;
-            p = exe_dir.parent_path() / "scripts" / "fetch_lyrics.py";
-            if (fs::exists(p)) return p;
-        }
-    }
-#else
-    char exe_buf[4096];
-    ssize_t n = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-    if (n > 0) {
-        exe_buf[n] = '\0';
-        fs::path exe_dir = fs::path(exe_buf).parent_path();
-        fs::path p = exe_dir / "scripts" / "fetch_lyrics.py";
-        if (fs::exists(p)) return p;
-        p = exe_dir.parent_path() / "scripts" / "fetch_lyrics.py";
-        if (fs::exists(p)) return p;
-    }
-#endif
-    return cwd_candidate;
-}
-
 } // namespace
 
 App::App() {
     settings_ = load_settings();
-    lyrics_script_ = find_lyrics_script();
+    jellyfin_.configure(settings_.jellyfin_server_url, settings_.jellyfin_api_key,
+                        settings_.jellyfin_skip_cert_check);
     
     // Inject the cache directory into local music paths so streamed songs
     // automatically appear in the local view for seamless offline playback
@@ -574,13 +535,13 @@ void App::write_load_timing_log(const std::string& title, bool is_local, double 
 }
 
 void App::launch_load_async(fs::path local_path, std::string title, std::string artist,
-                             std::string location_label, bool is_local, std::string video_id) {
+                             std::string location_label, bool is_local, std::string jellyfin_id) {
     if (load_thread_.joinable()) load_thread_.join(); // previous job already signaled done, safe to reap
     load_in_progress_ = true;
     load_ready_ = false;
     load_stage_ = is_local ? 4 : 1;
     load_started_at_ = std::chrono::steady_clock::now();
-    if (!is_local) status_line_ = "resolving \"" + title + "\" ...";
+    status_line_ = is_local ? "" : "resolving \"" + title + "\" ...";
 
     // This thread ONLY resolves (online) and probes metadata/duration —
     // both fast, no full decode. It publishes a result and returns. Full
@@ -589,7 +550,7 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
     // will join()) is never blocked waiting on decode — that's what
     // makes it safe to join from launch_load_async without risking a
     // freeze if the user switches tracks again quickly.
-    load_thread_ = std::thread([this, local_path, title, artist, location_label, is_local, video_id]() {
+    load_thread_ = std::thread([this, local_path, title, artist, location_label, is_local, jellyfin_id]() {
         using clock = std::chrono::steady_clock;
         auto t_start = clock::now();
         auto elapsed_s = [](clock::time_point from) {
@@ -600,6 +561,7 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
         pl.title = title;
         pl.artist = artist;
         pl.location_label = location_label;
+        pl.jellyfin_id = jellyfin_id;
 
         double t_resolve = 0.0, t_probe = 0.0;
 
@@ -608,10 +570,10 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
             load_stage_ = 1;
             auto t0 = clock::now();
             std::string err;
-            auto resolved = youtube_.resolve_by_id(video_id, title, artist, &err);
+            auto resolved = jellyfin_.resolve_by_id(jellyfin_id, title, artist, &err);
             t_resolve = elapsed_s(t0);
             if (!resolved) {
-                pl.error = "download failed: " + err;
+                pl.error = "jellyfin error: " + err;
                 write_load_timing_log(title, is_local, t_resolve, 0, elapsed_s(t_start), pl.error);
                 std::lock_guard<std::mutex> lk(load_mutex_);
                 pending_load_ = std::move(pl);
@@ -698,11 +660,21 @@ void App::launch_load_async(fs::path local_path, std::string title, std::string 
 // just gets discarded rather than clobbering the new/retried track's
 // lyrics. Shared by the initial per-track fetch (poll_pending_load) and
 // the manual retry hotkey (handle_key's 'l' case).
-void App::launch_lyrics_fetch(std::string title, std::string artist, fs::path path, bool force_network) {
+void App::launch_lyrics_fetch(std::string title, std::string artist, fs::path path,
+                              std::string jellyfin_item_id) {
     lyrics_ready_ = false;
     int my_epoch = ++lyrics_epoch_;
-    std::thread([this, title, artist, path, force_network, my_epoch]() {
-        LyricsResult r = fetch_synced_lyrics(title, artist, lyrics_script_.string(), path, force_network);
+    std::thread([this, title, artist, path, jellyfin_item_id, my_epoch]() {
+        // Server-side lyrics (Jellyfin /Audio/{id}/Lyrics) are only
+        // queried for Jellyfin-loaded tracks — local files have no server
+        // lookup here, only the local .lrc sidecar chain.
+        ServerLyricsProvider provider;
+        if (!jellyfin_item_id.empty()) {
+            provider = [this, id = jellyfin_item_id](std::string* err_out) {
+                return jellyfin_.fetch_lyrics_lrc(id, err_out);
+            };
+        }
+        LyricsResult r = fetch_lyrics(title, artist, provider, path);
         std::lock_guard<std::mutex> lock(lyrics_mutex_);
         if (my_epoch != lyrics_epoch_.load()) return; // a newer/retried fetch has since started — discard
         lyrics_result_ = std::move(r);
@@ -738,6 +710,14 @@ void App::poll_pending_load() {
     total_sec_ = pl.total_sec;
     metadata_ = pl.metadata;
     current_path_ = pl.path;
+    current_jellyfin_id_ = pl.jellyfin_id;
+    if (!pl.jellyfin_id.empty()) {
+        metadata_.extra_label = "Jellyfin ID";
+        metadata_.extra_value = pl.jellyfin_id;
+    } else {
+        metadata_.extra_label.clear();
+        metadata_.extra_value.clear();
+    }
     has_track_ = true;
     player_.clear_finished(); // see clear_finished()'s comment — closes the race that caused the double-skip bug
     waveform_envelope_.clear();
@@ -747,7 +727,7 @@ void App::poll_pending_load() {
     last_lyrics_status_.clear();
     fft_.reset(); // don't let the previous track's spectrum tail linger into this one's first frame
 
-    launch_lyrics_fetch(pl.title, pl.artist, pl.path);
+    launch_lyrics_fetch(pl.title, pl.artist, pl.path, pl.jellyfin_id);
 
     // This is the whole point of the redesign: play() is handed a
     // StreamingPcm that may have zero frames decoded yet. The audio
@@ -802,12 +782,15 @@ void App::launch_search_async(const std::string& query) {
     if (search_thread_.joinable()) search_thread_.join();
     search_in_progress_ = true;
     search_ready_ = false;
-    status_line_ = "searching online for \"" + query + "\" ...";
+    pending_search_error_.clear();
+    status_line_ = "searching jellyfin library\u2026";
 
     search_thread_ = std::thread([this, query]() {
-        auto results = online_.search(query);
+        std::string err;
+        auto results = jellyfin_.search(query, 30, &err);
         std::lock_guard<std::mutex> lk(search_mutex_);
         pending_search_results_ = std::move(results);
+        pending_search_error_ = std::move(err);
         search_ready_ = true;
     });
 }
@@ -815,17 +798,25 @@ void App::launch_search_async(const std::string& query) {
 void App::poll_pending_search() {
     if (!search_ready_.load()) return;
     std::vector<OnlineResult> results;
+    std::string error;
     {
         std::lock_guard<std::mutex> lk(search_mutex_);
         results = std::move(pending_search_results_);
+        error = std::move(pending_search_error_);
     }
     search_ready_ = false;
     search_in_progress_ = false;
 
+    if (!error.empty() && results.empty()) {
+        status_line_ = error;
+        online_view_.clear();
+        return;
+    }
+
     online_view_ = std::move(results);
     selected_ = 0;
     scroll_ = 0;
-    status_line_ = online_view_.empty() ? "no online results" : "";
+    status_line_ = online_view_.empty() ? "no jellyfin results" : "";
 }
 
 void App::play_selected() {
@@ -1178,14 +1169,15 @@ void App::start_local_track(const LocalTrack& track) {
     if (load_in_progress_.load()) { status_line_ = "still loading the previous track ..."; return; }
     fs::path parent = track.path.parent_path().filename();
     launch_load_async(track.path, track.title, track.folder_artist == "-" ? "" : track.folder_artist,
-                       parent.string() + "/", /*is_local=*/true, /*video_id=*/"");
+                       parent.string() + "/", /*is_local=*/true, /*jellyfin_id=*/"");
 }
 
 void App::start_online_track(const OnlineResult& result) {
     if (load_in_progress_.load()) { status_line_ = "still loading the previous track ..."; return; }
-    // Pass "" for artist so the lyrics search queries just the YouTube video title
-    // (which usually contains "Artist - Song Name" perfectly), instead of appending the channel name.
-    launch_load_async({}, result.title, "", "youtube", /*is_local=*/false, result.video_id);
+    // Artist comes back in the resolve step (server metadata) — passing ""
+    // here keeps the call clean; the Jellyfin item id is the only thing
+    // that must ride through to the loader.
+    launch_load_async({}, result.title, "", "jellyfin", /*is_local=*/false, result.video_id);
 }
 
 // ---------------------------------------------------------------------
@@ -1300,7 +1292,8 @@ void App::handle_key(int key) {
             break;
         case 'l': case 'L': // retry lyrics fetch for the current track
             if (has_track_) {
-                launch_lyrics_fetch(metadata_.name, metadata_.artist == "-" ? "" : metadata_.artist, current_path_, /*force_network=*/true);
+                launch_lyrics_fetch(metadata_.name, metadata_.artist == "-" ? "" : metadata_.artist,
+                                    current_path_, current_jellyfin_id_);
                 status_line_ = "retrying lyrics ...";
             }
             break;
@@ -1311,7 +1304,7 @@ void App::handle_key(int key) {
             break;
         case 'y': case 'Y': // save cached stream to local music path
             if (has_track_) {
-                if (current_path_.string().find(".cache") != std::string::npos || metadata_.location == "youtube") {
+                if (current_path_.string().find(".cache") != std::string::npos || metadata_.location == "jellyfin") {
                     std::string dest_dir;
                     if (!settings_.local_music_paths.empty()) {
                         dest_dir = settings_.local_music_paths[0];
@@ -1889,7 +1882,7 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
     return out;
 }
 std::vector<std::string> App::build_search_bar(int total_width) const {
-    std::string label = (list_source_ == ListSource::Online) ? "SEARCH ONLINE" : "SEARCH LOCAL";
+    std::string label = (list_source_ == ListSource::Online) ? "SEARCH JELLYFIN" : "SEARCH LOCAL";
 
     std::string content;
     if (mode_ == Mode::Search) {
@@ -1912,7 +1905,7 @@ std::vector<std::string> App::build_search_bar(int total_width) const {
 
 std::vector<std::string> App::build_list_panel(int total_width, int height) const {
     bool online = (list_source_ == ListSource::Online);
-    std::string label = online ? "ONLINE RESULTS"
+    std::string label = online ? "JELLYFIN RESULTS"
                                 : "LOCAL AUDIO FILES (sort: " + std::string(sort_mode_name(local_sort_mode_)) + ")";
     size_t total = online ? online_view_.size() : local_view_.size();
     int inner = total_width - 4;
@@ -2204,7 +2197,7 @@ void App::build_settings_screen(std::ostringstream& frame, int W, int player_h) 
         // past player_h.
         static const char* ref_l[kRefRowCount] = {"Open Settings", "Navigate Up", "Navigate Down", "Play / Pause",
                                                     "Next Track", "Prev Track", "Toggle Repeat", "Toggle Shuffle",
-                                                    "Search Local", "Search Online", "Quit Application"};
+                                                    "Search Local", "Search Jellyfin", "Quit Application"};
         std::vector<char> letters;
         for (char c = 'A'; c <= 'Z'; ++c) if (settings_.font_map.count(c)) letters.push_back(c);
         int display_count = kRefRowCount + 1 + static_cast<int>(letters.size()); // +1 for the divider row
