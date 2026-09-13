@@ -785,6 +785,7 @@ void App::launch_search_async(const std::string& query) {
     search_in_progress_ = true;
     search_ready_ = false;
     pending_search_error_.clear();
+    online_fetch_kind_ = OnlineFetchKind::Search;
     status_line_ = "searching jellyfin library\u2026";
 
     search_thread_ = std::thread([this, query]() {
@@ -802,8 +803,27 @@ void App::launch_browse_async(const std::string& item_id, const std::string& tit
     search_in_progress_ = true;
     search_ready_ = false;
     pending_search_error_.clear();
+    online_fetch_kind_ = OnlineFetchKind::Browse;
     online_breadcrumb_ = title;
     status_line_ = "loading \"" + title + "\" ...";
+
+    search_thread_ = std::thread([this, item_id]() {
+        std::string err;
+        auto results = jellyfin_.list_children(item_id, &err);
+        std::lock_guard<std::mutex> lk(search_mutex_);
+        pending_search_results_ = std::move(results);
+        pending_search_error_ = std::move(err);
+        search_ready_ = true;
+    });
+}
+
+void App::launch_queue_async(const std::string& item_id, const std::string& title) {
+    if (search_thread_.joinable()) search_thread_.join();
+    search_in_progress_ = true;
+    search_ready_ = false;
+    pending_search_error_.clear();
+    online_fetch_kind_ = OnlineFetchKind::QueueAdd;
+    status_line_ = "adding \"" + title + "\" to queue ...";
 
     search_thread_ = std::thread([this, item_id]() {
         std::string err;
@@ -826,10 +846,22 @@ void App::poll_pending_search() {
     }
     search_ready_ = false;
     search_in_progress_ = false;
+    OnlineFetchKind kind = online_fetch_kind_;
+    online_fetch_kind_ = OnlineFetchKind::Search;
 
     if (!error.empty() && results.empty()) {
         status_line_ = error;
         online_view_.clear();
+        return;
+    }
+
+    if (kind == OnlineFetchKind::QueueAdd) {
+        // Don't touch the on-screen list — dump the tracks into the queue.
+        for (auto& r : results) {
+            queue_.push_back({false, r.title, r.uploader, {}, r.video_id});
+        }
+        clamp_queue_selected();
+        status_line_ = results.empty() ? "no tracks in that playlist/album" : "added " + std::to_string(results.size()) + " tracks to queue";
         return;
     }
 
@@ -848,6 +880,24 @@ void App::play_selected() {
     if (list_len == 0 || selected_ < 0 || selected_ >= static_cast<int>(list_len)) return;
     if (list_source_ == ListSource::Local) start_local_track(local_view_[selected_]);
     else start_online_track(online_view_[selected_]);
+}
+
+void App::play_from_queue(int index) {
+    if (index < 0 || index >= static_cast<int>(queue_.size())) return;
+    QueueItem item = queue_[index];
+    // Jumps into the queue: everything up to and including the picked
+    // track is consumed (skipped + the pick itself), so the remaining
+    // up-next order starts right after what the user chose.
+    queue_.erase(queue_.begin(), queue_.begin() + index + 1);
+    queue_selected_ = 0;
+    clamp_queue_selected();
+    if (item.is_local) {
+        LocalTrack t{fs::path(item.local_path).stem().string(), item.local_path, item.artist};
+        start_local_track(t);
+    } else {
+        OnlineResult r{item.video_id, item.title, item.artist, "Audio"};
+        start_online_track(r);
+    }
 }
 
 void App::play_relative(int delta) {
@@ -918,8 +968,8 @@ void App::queue_add_selected() {
         queue_.push_back({true, t.title, t.folder_artist, t.path, ""});
     } else {
         const auto& r = online_view_[selected_];
-        if (r.type == "Album" || r.type == "Playlist") { // containers: Enter-equivalent drill-in, not queueable
-            start_online_track(r);
+        if (r.type == "Album" || r.type == "Playlist") { // add the whole container, not just one slot
+            launch_queue_async(r.video_id, r.title);
             return;
         }
         queue_.push_back({false, r.title, r.uploader, {}, r.video_id});
@@ -1410,7 +1460,8 @@ void App::handle_key(int key) {
             status_line_ = std::string("sort: ") + sort_mode_name(local_sort_mode_);
             break;
         case '\r': case '\n':
-            play_selected();
+            if (queue_focus_ && !queue_.empty()) play_from_queue(queue_selected_);
+            else play_selected();
             break;
         case '/':
             mode_ = Mode::Search;

@@ -147,14 +147,21 @@ private:
     void poll_pending_waveform();
 
     // --- async online search ---
+    // What the single in-flight remote fetch is for: a fresh /s: search,
+    // drilling into a container, or collecting a container's tracks to
+    // dump into the queue. All three share search_thread_ + the pending
+    // buffers; poll_pending_search() routes the result by kind.
+    enum class OnlineFetchKind { Search, Browse, QueueAdd };
     std::thread search_thread_;
     std::mutex search_mutex_;
     std::atomic<bool> search_ready_{false};
     std::atomic<bool> search_in_progress_{false};
+    OnlineFetchKind online_fetch_kind_ = OnlineFetchKind::Search;
     std::vector<OnlineResult> pending_search_results_;
     std::string pending_search_error_;
     void launch_search_async(const std::string& query);
     void launch_browse_async(const std::string& item_id, const std::string& title);
+    void launch_queue_async(const std::string& item_id, const std::string& title);
     void poll_pending_search();
 
     // --- settings panel (5 tabs: Colors, On/Off, Animation, Reference, About App) ---
@@ -210,6 +217,7 @@ private:
     void start_local_track(const LocalTrack& track);
     void start_online_track(const OnlineResult& result);
     void play_selected();
+    void play_from_queue(int index);
     void play_relative(int delta);
     void play_relative_random();
     void advance_track();
