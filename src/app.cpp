@@ -798,7 +798,7 @@ void App::launch_search_async(const std::string& query) {
     });
 }
 
-void App::launch_browse_async(const std::string& item_id, const std::string& title) {
+void App::launch_browse_async(const std::string& item_id, const std::string& title, bool is_artist) {
     if (search_thread_.joinable()) search_thread_.join();
     search_in_progress_ = true;
     search_ready_ = false;
@@ -807,9 +807,10 @@ void App::launch_browse_async(const std::string& item_id, const std::string& tit
     online_breadcrumb_ = title;
     status_line_ = "loading \"" + title + "\" ...";
 
-    search_thread_ = std::thread([this, item_id]() {
+    search_thread_ = std::thread([this, item_id, is_artist]() {
         std::string err;
-        auto results = jellyfin_.list_children(item_id, &err);
+        auto results = is_artist ? jellyfin_.list_artist_tracks(item_id, &err)
+                                 : jellyfin_.list_children(item_id, &err);
         std::lock_guard<std::mutex> lk(search_mutex_);
         pending_search_results_ = std::move(results);
         pending_search_error_ = std::move(err);
@@ -817,7 +818,7 @@ void App::launch_browse_async(const std::string& item_id, const std::string& tit
     });
 }
 
-void App::launch_queue_async(const std::string& item_id, const std::string& title) {
+void App::launch_queue_async(const std::string& item_id, const std::string& title, bool is_artist) {
     if (search_thread_.joinable()) search_thread_.join();
     search_in_progress_ = true;
     search_ready_ = false;
@@ -825,9 +826,10 @@ void App::launch_queue_async(const std::string& item_id, const std::string& titl
     online_fetch_kind_ = OnlineFetchKind::QueueAdd;
     status_line_ = "adding \"" + title + "\" to queue ...";
 
-    search_thread_ = std::thread([this, item_id]() {
+    search_thread_ = std::thread([this, item_id, is_artist]() {
         std::string err;
-        auto results = jellyfin_.list_children(item_id, &err);
+        auto results = is_artist ? jellyfin_.list_artist_tracks(item_id, &err)
+                                 : jellyfin_.list_children(item_id, &err);
         std::lock_guard<std::mutex> lk(search_mutex_);
         pending_search_results_ = std::move(results);
         pending_search_error_ = std::move(err);
@@ -968,8 +970,8 @@ void App::queue_add_selected() {
         queue_.push_back({true, t.title, t.folder_artist, t.path, ""});
     } else {
         const auto& r = online_view_[selected_];
-        if (r.type == "Album" || r.type == "Playlist") { // add the whole container, not just one slot
-            launch_queue_async(r.video_id, r.title);
+        if (r.type == "Album" || r.type == "Playlist" || r.type == "MusicArtist") { // add the whole container, not just one slot
+            launch_queue_async(r.video_id, r.title, r.type == "MusicArtist");
             return;
         }
         queue_.push_back({false, r.title, r.uploader, {}, r.video_id});
@@ -1251,11 +1253,11 @@ void App::start_local_track(const LocalTrack& track) {
 }
 
 void App::start_online_track(const OnlineResult& result) {
-    // Album/playlist hits aren't audio — drill into their track list
-    // instead of trying to play them.
-    if (result.type == "Album" || result.type == "Playlist") {
+    // Album/playlist/artist hits aren't audio — drill into their track
+    // list instead of trying to play them.
+    if (result.type == "Album" || result.type == "Playlist" || result.type == "MusicArtist") {
         if (search_in_progress_.load()) { status_line_ = "still loading, hang on ..."; return; }
-        launch_browse_async(result.video_id, result.title);
+        launch_browse_async(result.video_id, result.title, result.type == "MusicArtist");
         return;
     }
     if (load_in_progress_.load()) { status_line_ = "still loading the previous track ..."; return; }
@@ -2037,7 +2039,10 @@ std::vector<std::string> App::build_list_panel(int total_width, int height) cons
                 int title_w = std::max(5, inner - idx_w - 2 - 2 - uploader_w);
                 std::string t_idx = apply_font_map(std::to_string(idx + 1), settings_.font_map);
                 std::string t_title = apply_font_map(r.title, settings_.font_map);
-                std::string side = (r.type == "Album" || r.type == "Playlist") ? r.type : r.uploader;
+                std::string side;
+                if (r.type == "Album" || r.type == "Playlist") side = r.type;
+                else if (r.type == "MusicArtist") side = "ARTIST";
+                else side = r.uploader;
                 std::string t_uploader = apply_font_map(side, settings_.font_map);
                 content = pad_right(t_idx, idx_w) + settings_.list_separator + " "
                         + pad_right(truncate_str(t_title, title_w), title_w) + settings_.list_separator + " "

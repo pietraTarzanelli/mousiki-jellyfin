@@ -77,36 +77,57 @@ std::vector<OnlineResult> JellyfinSource::search(const std::string& query, int c
         return {};
     }
 
+    std::vector<OnlineResult> results;
+
+    // 1) Tracks + containers in one request.
     std::string url = base_url_ + "/Search/Hints?searchTerm=" + url_encode(query) +
                       "&includeItemTypes=Audio,Album,Playlist&limit=" + std::to_string(count);
     std::string body, err;
-    if (!http_get_json(url, auth_header(), insecure_, body, err)) {
-        if (error_out) *error_out = err;
-        return {};
+    if (http_get_json(url, auth_header(), insecure_, body, err)) {
+        minijson::Value root;
+        if (minijson::parse(body, root)) {
+            const minijson::Value* hints = root.get("SearchHints");
+            if (hints && hints->is_array()) {
+                for (const auto& hint : hints->arr) {
+                    std::string type = sget(&hint, "Type");
+                    if (type != "Audio" && type != "Album" && type != "Playlist") continue;
+
+                    OnlineResult item;
+                    item.video_id = sget(&hint, "Id");
+                    item.title = sget(&hint, "Name");
+                    item.uploader = artist_from_hint(hint);
+                    item.type = type;
+                    if (!item.video_id.empty() && !item.title.empty()) results.push_back(std::move(item));
+                }
+            }
+        }
+    } else if (error_out && results.empty()) {
+        *error_out = err;
     }
 
-    minijson::Value root;
-    if (!minijson::parse(body, root)) {
-        if (error_out) *error_out = "server returned unparseable JSON";
-        return {};
+    // 2) Music artists via their own request — the server only returns
+    //    artist hits when Artist is the sole includeItemTypes value.
+    std::string artist_url = base_url_ + "/Search/Hints?searchTerm=" + url_encode(query) +
+                             "&includeItemTypes=Artist&limit=" + std::to_string(count);
+    std::string abody, aerr;
+    if (http_get_json(artist_url, auth_header(), insecure_, abody, aerr)) {
+        minijson::Value aroot;
+        if (minijson::parse(abody, aroot)) {
+            const minijson::Value* hints = aroot.get("SearchHints");
+            if (hints && hints->is_array()) {
+                for (const auto& hint : hints->arr) {
+                    if (sget(&hint, "Type") != "MusicArtist") continue; // drop raw Person people
+
+                    OnlineResult item;
+                    item.video_id = sget(&hint, "Id");
+                    item.title = sget(&hint, "Name");
+                    item.type = "MusicArtist";
+                    if (!item.video_id.empty() && !item.title.empty()) results.push_back(std::move(item));
+                }
+            }
+        }
     }
 
-    const minijson::Value* hints = root.get("SearchHints");
-    if (!hints || !hints->is_array()) return {};
-
-    std::vector<OnlineResult> results;
-    for (const auto& hint : hints->arr) {
-        std::string type = sget(&hint, "Type");
-        if (type != "Audio" && type != "Album" && type != "Playlist") continue; // skip artist/api/program hints
-
-        OnlineResult item;
-        item.video_id = sget(&hint, "Id");
-        item.title = sget(&hint, "Name");
-        item.uploader = artist_from_hint(hint);
-        item.type = type;
-        if (item.video_id.empty() || item.title.empty()) continue;
-        results.push_back(std::move(item));
-    }
     return results;
 }
 
@@ -152,6 +173,50 @@ std::vector<OnlineResult> JellyfinSource::list_children(const std::string& paren
     minijson::Value root;
     if (!minijson::parse(body, root) || !root.is_object()) {
         if (error_out) *error_out = "server returned unparseable item list";
+        return {};
+    }
+
+    const minijson::Value* items = root.get("Items");
+    if (!items || !items->is_array()) return {};
+
+    std::vector<OnlineResult> results;
+    for (const auto& it : items->arr) {
+        if (sget(&it, "Type") != "Audio") continue;
+        OnlineResult item;
+        item.video_id = sget(&it, "Id");
+        item.title = sget(&it, "Name");
+        item.uploader = artist_from_hint(it);
+        item.type = "Audio";
+        if (item.video_id.empty() || item.title.empty()) continue;
+        results.push_back(std::move(item));
+    }
+    return results;
+}
+
+std::vector<OnlineResult> JellyfinSource::list_artist_tracks(const std::string& artist_id, std::string* error_out) {
+    if (!configured()) {
+        if (error_out) *error_out = "Jellyfin server not configured";
+        return {};
+    }
+    if (artist_id.empty()) {
+        if (error_out) *error_out = "empty artist id";
+        return {};
+    }
+
+    std::string url = base_url_ + "/Items?ArtistIds=" + url_encode(artist_id) +
+                      "&IncludeItemTypes=Audio&Recursive=true";
+    std::string uid = resolve_user_id();
+    if (!uid.empty()) url += "&UserId=" + url_encode(uid);
+
+    std::string body, err;
+    if (!http_get_json(url, auth_header(), insecure_, body, err)) {
+        if (error_out) *error_out = err;
+        return {};
+    }
+
+    minijson::Value root;
+    if (!minijson::parse(body, root) || !root.is_object()) {
+        if (error_out) *error_out = "server returned unparseable artist list";
         return {};
     }
 

@@ -43,9 +43,11 @@ public:
     bool configured() const;
 
     // GET /Search/Hints?searchTerm=..&includeItemTypes=Audio,Album,Playlist
-    // Returns hits of those three types mapped to OnlineResult (type -
-    // "Audio" | "Album" | "Playlist"). An unreachable/misconfigured server
-    // yields an error via error_out.
+    // plus a second query with Artist so music artists show up too (the
+    // server suppresses artist hits when other types are combined, so they
+    // have to come from a separate request). Only "MusicArtist" hints are
+    // kept (raw "Person" people are dropped). type = one of "Audio",
+    // "Album", "Playlist", "MusicArtist".
     std::vector<OnlineResult> search(const std::string& query, int count = 50,
                                      std::string* error_out = nullptr);
 
@@ -55,6 +57,12 @@ public:
     // don't strictly need it). Returns the contained Audio items.
     std::vector<OnlineResult> list_children(const std::string& parent_id,
                                             std::string* error_out = nullptr);
+
+    // GET /Items?ArtistIds=<id>&IncludeItemTypes=Audio&Recursive=true:
+    // every track by a music artist. Used when the user drills into or
+    // queue-adds an artist result.
+    std::vector<OnlineResult> list_artist_tracks(const std::string& artist_id,
+                                                 std::string* error_out = nullptr);
 
     // GET /Items/{id} for the container/metadata, then downloads
     // GET /Audio/{id}/stream into the cache (downloaded-once, like the

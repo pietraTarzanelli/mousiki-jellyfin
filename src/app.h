@@ -160,8 +160,8 @@ private:
     std::vector<OnlineResult> pending_search_results_;
     std::string pending_search_error_;
     void launch_search_async(const std::string& query);
-    void launch_browse_async(const std::string& item_id, const std::string& title);
-    void launch_queue_async(const std::string& item_id, const std::string& title);
+    void launch_browse_async(const std::string& item_id, const std::string& title, bool is_artist = false);
+    void launch_queue_async(const std::string& item_id, const std::string& title, bool is_artist = false);
     void poll_pending_search();
 
     // --- settings panel (5 tabs: Colors, On/Off, Animation, Reference, About App) ---
