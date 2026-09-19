@@ -298,7 +298,11 @@ void apply_default_hotkeys(Settings& s) {
             {"HKeyIncreaseVolume",              "1"},
             {"HKeyDecreaseVolume",              "2"},
             {"HKeyAddHoveringSongToQueue",      "a"},
+            {"HKeyAppendToQueue",                "z"},
+            {"HKeyPlayList",                     "o"},
+            {"HKeyClearQueue",                   "x"},
             {"HKeyRemoveHoveringSongFromQueue", "d"},
+            {"HKeyAddHoveringSongToPlaylist",    "g"},
             {"HKeySwitchBetweenCards",          "TAB"},
             {"HKeyToggleRepeat",                "r"},
             {"HKeyTogglePlayPause",             "p"},
@@ -840,7 +844,7 @@ void save_settings(const Settings& s) {
         "HKeyNavigateUp", "HKeyNavigateDown", "HKeyPlay", "HKeyPlayNextSong", "HKeyPlayPreviousSong",
         "HKeyTogglePlayPause", "HKeyToggleRepeat", "HKeyToggleShuffle", "HKeySearch", "HKeySearchOnline",
         "HKeySeekForward", "HKeySeekBackward", "HKeyIncreaseVolume", "HKeyDecreaseVolume",
-        "HKeyAddHoveringSongToQueue", "HKeyRemoveHoveringSongFromQueue", "HKeySwitchBetweenCards",
+        "HKeyAddHoveringSongToQueue", "HKeyAppendToQueue", "HKeyPlayList", "HKeyClearQueue", "HKeyRemoveHoveringSongFromQueue", "HKeyAddHoveringSongToPlaylist", "HKeySwitchBetweenCards",
         "HKeyFilterForFolder", "HKeyClearFilter", "HKeyQuit", "HKeyResetPreference", "HKeyDownloadStream",
     };
     for (const char* name : hkey_order) {

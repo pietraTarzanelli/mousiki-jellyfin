@@ -64,8 +64,16 @@ private:
     ListSource pre_search_list_source_ = ListSource::Local;
     std::string pre_search_local_query_;
     std::string last_online_query_;
+    OnlineSearchScope online_search_scope_ = OnlineSearchScope::All; // scope of the last committed online search (p:/a:/b:)
     int local_sort_mode_ = 0; // 0=folder order, 1=title A-Z, 2=artist A-Z
     static constexpr int kListVisibleRows = 8;
+    static constexpr int kOnlinePageSize = 200; // tracks per lazy-loaded Jellyfin library page
+    bool online_is_recent_ = false;   // online_view_ currently holds the whole-library (recent) listing
+    int online_total_ = 0;            // server TotalRecordCount for the recent listing
+    int online_next_start_ = 0;       // StartIndex for the next lazy page
+    bool online_has_more_ = false;
+    bool online_loading_more_ = false;
+    bool startup_autoplay_pending_ = false; // set at launch; first recent page triggers shuffle autoplay
 
     mutable std::mutex row_meta_mutex_;
     std::unordered_map<std::string, RowMeta> row_meta_cache_;
@@ -77,6 +85,7 @@ private:
     int queue_selected_ = 0;   // cursor/"hovering" row, only meaningful once queue_focus_ has been used
     int queue_scroll_ = 0;
     bool queue_focus_ = false; // Tab toggles which panel Up/Down navigates
+    bool queue_add_prepend_ = false; // container add target: true = front of queue (a), false = end (z)
 
     // --- now playing ---
     bool has_track_ = false;
@@ -147,22 +156,53 @@ private:
     void poll_pending_waveform();
 
     // --- async online search ---
-    // What the single in-flight remote fetch is for: a fresh /s: search,
-    // drilling into a container, or collecting a container's tracks to
-    // dump into the queue. All three share search_thread_ + the pending
-    // buffers; poll_pending_search() routes the result by kind.
-    enum class OnlineFetchKind { Search, Browse, QueueAdd };
+    // What the single in-flight remote fetch is for: a fresh Jellyfin
+    // search, drilling into a container, collecting a container's tracks
+    // to dump into the queue, or paging through the whole-library "recent"
+    // listing. All of them share search_thread_ + the pending buffers;
+    // poll_pending_search() routes the result by kind.
+    enum class OnlineFetchKind {
+        Search,       // text search into online_view_
+        Browse,       // container drill (album/artist/playlist -> children)
+        QueueAdd,     // queue a container's tracks (Jellyfin auto-expands)
+        Recent,       // paged "recent library" listing (Jellyfin-first tab)
+        PlaylistPick, // GET the user's playlists -> online_view_ becomes the
+                      // "choose a playlist" picker (Task 3)
+        PlaylistAdd,  // POST an item into a chosen playlist
+    };
     std::thread search_thread_;
     std::mutex search_mutex_;
     std::atomic<bool> search_ready_{false};
     std::atomic<bool> search_in_progress_{false};
     OnlineFetchKind online_fetch_kind_ = OnlineFetchKind::Search;
+    int online_fetch_start_ = 0;       // StartIndex of the in-flight Recent page
+    int pending_search_total_ = 0;     // TotalRecordCount reported by the in-flight fetch
     std::vector<OnlineResult> pending_search_results_;
     std::string pending_search_error_;
-    void launch_search_async(const std::string& query);
+    void launch_search_async(const std::string& query, OnlineSearchScope scope = OnlineSearchScope::All);
     void launch_browse_async(const std::string& item_id, const std::string& title, bool is_artist = false);
     void launch_queue_async(const std::string& item_id, const std::string& title, bool is_artist = false);
+    void launch_recent_async(int start_index);
+    void launch_playlist_pick_async();  // list the user's playlists into the picker
+    void launch_playlist_add_async(const std::string& playlist_id); // POST the pending item into a picked playlist
+    void restore_playlist_pick_view();  // put the pre-pick list back after Enter/Esc
+    void maybe_load_online_more();
     void poll_pending_search();
+
+    // --- Task 3: "add hovering song to a playlist" picker ---
+    // Pressing 'g' while hovering a Jellyfin item temporarily swaps the
+    // online list panel (left of the queue) for the user's playlists. Enter
+    // adds the remembered item (Jellyfin auto-expands album/artist/playlist
+    // containers server-side), Esc puts the pre-pick browse list back.
+    OnlineResult pending_playlist_item_;   // the hovered item captured on 'g'
+    std::string pending_playlist_name_;    // name of the chosen playlist (for the status line)
+    bool playlist_pick_active_ = false;    // online list is showing the "choose playlist" picker
+    std::vector<OnlineResult> pre_pick_view_;   // snapshot of online_view_ (restore after Enter/Esc)
+    int pre_pick_selected_ = 0, pre_pick_scroll_ = 0;
+    std::string pre_pick_breadcrumb_;
+    bool pre_pick_is_recent_ = false;
+    int pre_pick_total_ = 0, pre_pick_next_start_ = 0;
+    bool pre_pick_has_more_ = false, pre_pick_loading_more_ = false;
 
     // --- settings panel (5 tabs: Colors, On/Off, Animation, Reference, About App) ---
     // Rendering uses absolute cursor positioning (\x1b[y;xH) rather than
@@ -221,7 +261,8 @@ private:
     void play_relative(int delta);
     void play_relative_random();
     void advance_track();
-    void queue_add_selected();
+    void queue_add_selected(bool at_start = false); // false = append (z), true = insert at front (a)
+    void play_list(); // 'o' — queue the rest of the current list from the selection and play it
     void queue_remove_last();
     void queue_remove_hovering();
     void queue_move_hovering(int dir); // dir=-1 up, +1 down
@@ -230,6 +271,7 @@ private:
     void ensure_visible_row_meta();
     void recompute_waveform_for_current_track();
     std::string render_frame(TerminalIO& term);
+    std::vector<std::string> build_keybind_hint() const;
 
     // --- box drawing helpers (use configured border chars) ---
     std::string box_top(const std::string& label, int total_width, const std::string& border_ansi = "") const;

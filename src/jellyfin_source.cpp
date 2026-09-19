@@ -71,17 +71,66 @@ std::string JellyfinSource::auth_header() const {
 // Search
 // =====================================================================
 
-std::vector<OnlineResult> JellyfinSource::search(const std::string& query, int count, std::string* error_out) {
+std::vector<OnlineResult> JellyfinSource::search(const std::string& query, int count, std::string* error_out,
+                                                 OnlineSearchScope scope) {
     if (!configured()) {
         if (error_out) *error_out = "Jellyfin server not configured (set JellyfinServerUrl + JellyfinApiKey in config.txt)";
         return {};
     }
 
+    // A bare /p: (empty text) means "list every playlist" — reuse the
+    // exact request the add-to-playlist picker uses so the two views can
+    // never disagree about which playlists exist.
+    if (scope == OnlineSearchScope::Playlist && query.empty()) {
+        return list_playlists(error_out);
+    }
+
+    const char* scoped_type = nullptr;
+    switch (scope) {
+        case OnlineSearchScope::Playlist: scoped_type = "Playlist"; break;
+        case OnlineSearchScope::Artist:   scoped_type = "Artist"; break;   // raw Person hints dropped below
+        case OnlineSearchScope::Album:    scoped_type = "MusicAlbum"; break; // "Album" is not a valid hint type on this server
+        case OnlineSearchScope::All:      break;
+    }
+
     std::vector<OnlineResult> results;
 
-    // 1) Tracks + containers in one request.
+    if (scoped_type) {
+        // Single-type request only — the scope is enforced server-side by
+        // includeItemTypes, so no other type can leak into the results.
+        std::string url = base_url_ + "/Search/Hints?searchTerm=" + url_encode(query) +
+                          "&includeItemTypes=" + scoped_type + "&limit=" + std::to_string(count);
+        std::string body, err;
+        if (!http_get_json(url, auth_header(), insecure_, body, err)) {
+            if (error_out) *error_out = err;
+            return {};
+        }
+        minijson::Value root;
+        if (!minijson::parse(body, root)) {
+            if (error_out) *error_out = "server returned unparseable search results";
+            return {};
+        }
+        const minijson::Value* hints = root.get("SearchHints");
+        if (!hints || !hints->is_array()) return results;
+
+        const char* want = (scope == OnlineSearchScope::Artist) ? "MusicArtist" : scoped_type;
+        for (const auto& hint : hints->arr) {
+            if (sget(&hint, "Type") != want) continue;
+            OnlineResult item;
+            item.video_id = sget(&hint, "Id");
+            item.title = sget(&hint, "Name");
+            item.uploader = artist_from_hint(hint);
+            item.type = want;
+            if (!item.video_id.empty() && !item.title.empty()) results.push_back(std::move(item));
+        }
+        return results;
+    }
+
+    // 1) Tracks + containers in one request. Albums are "MusicAlbum" hints
+    //    (the bare "Album" type isn't a valid Search/Hints value on this
+    //    server and silently yields zero album hits).
     std::string url = base_url_ + "/Search/Hints?searchTerm=" + url_encode(query) +
-                      "&includeItemTypes=Audio,Album,Playlist&limit=" + std::to_string(count);
+                      "&includeItemTypes=Audio,MusicAlbum,Playlist&limit=" + std::to_string(count);
     std::string body, err;
     if (http_get_json(url, auth_header(), insecure_, body, err)) {
         minijson::Value root;
@@ -90,7 +139,7 @@ std::vector<OnlineResult> JellyfinSource::search(const std::string& query, int c
             if (hints && hints->is_array()) {
                 for (const auto& hint : hints->arr) {
                     std::string type = sget(&hint, "Type");
-                    if (type != "Audio" && type != "Album" && type != "Playlist") continue;
+                    if (type != "Audio" && type != "Album" && type != "MusicAlbum" && type != "Playlist") continue;
 
                     OnlineResult item;
                     item.video_id = sget(&hint, "Id");
@@ -235,6 +284,134 @@ std::vector<OnlineResult> JellyfinSource::list_artist_tracks(const std::string& 
         results.push_back(std::move(item));
     }
     return results;
+}
+
+// =====================================================================
+// Whole-library "recently added" listing
+// =====================================================================
+
+std::vector<OnlineResult> JellyfinSource::list_recent(int limit, int start_index,
+                                                       int* total_out, std::string* error_out) {
+    if (total_out) *total_out = 0;
+    if (!configured()) {
+        if (error_out) *error_out = "Jellyfin server not configured";
+        return {};
+    }
+
+    if (start_index < 0) start_index = 0;
+    if (limit < 1) limit = 1;
+
+    std::string uid = resolve_user_id();
+    std::string url = base_url_ + "/Items?IncludeItemTypes=Audio&Recursive=true"
+                      "&SortBy=DateCreated&SortOrder=Descending"
+                      "&StartIndex=" + std::to_string(start_index) +
+                      "&Limit=" + std::to_string(limit);
+    if (!uid.empty()) url += "&UserId=" + url_encode(uid);
+
+    std::string body, err;
+    if (!http_get_json(url, auth_header(), insecure_, body, err)) {
+        if (error_out) *error_out = err;
+        return {};
+    }
+
+    minijson::Value root;
+    if (!minijson::parse(body, root) || !root.is_object()) {
+        if (error_out) *error_out = "server returned unparseable item list";
+        return {};
+    }
+
+    if (total_out) {
+        const minijson::Value* total = root.get("TotalRecordCount");
+        if (total) *total_out = static_cast<int>(total->as_number());
+    }
+
+    const minijson::Value* items = root.get("Items");
+    if (!items || !items->is_array()) return {};
+
+    std::vector<OnlineResult> results;
+    results.reserve(items->arr.size());
+    for (const auto& it : items->arr) {
+        if (sget(&it, "Type") != "Audio") continue;
+        OnlineResult item;
+        item.video_id = sget(&it, "Id");
+        item.title = sget(&it, "Name");
+        item.uploader = artist_from_hint(it);
+        item.type = "Audio";
+        if (item.video_id.empty() || item.title.empty()) continue;
+        results.push_back(std::move(item));
+    }
+    return results;
+}
+
+// =====================================================================
+// Playlists
+// =====================================================================
+
+std::vector<OnlineResult> JellyfinSource::list_playlists(std::string* error_out) {
+    if (!configured()) {
+        if (error_out) *error_out = "Jellyfin server not configured";
+        return {};
+    }
+
+    // Every playlist the API key can see (the app runs as an admin key, so
+    // without a UserId filter this returns ALL playlists across users —
+    // Albums/collections created from playlists don't get collapsed into
+    // the owned-only view the way a user-scoped query does). Returns the
+    // containers as rows; like search results, they're Type "Playlist".
+    std::string url = base_url_ + "/Items?IncludeItemTypes=Playlist&Recursive=true&Limit=500";
+    std::string body, err;
+    if (!http_get_json(url, auth_header(), insecure_, body, err)) {
+        if (error_out) *error_out = err;
+        return {};
+    }
+
+    minijson::Value root;
+    if (!minijson::parse(body, root) || !root.is_object()) {
+        if (error_out) *error_out = "server returned unparseable playlist list";
+        return {};
+    }
+
+    const minijson::Value* items = root.get("Items");
+    if (!items || !items->is_array()) return {};
+
+    std::vector<OnlineResult> results;
+    results.reserve(items->arr.size());
+    for (const auto& it : items->arr) {
+        if (sget(&it, "Type") != "Playlist") continue;
+        OnlineResult item;
+        item.video_id = sget(&it, "Id");
+        item.title = sget(&it, "Name");
+        item.uploader = "playlist";
+        item.type = "Playlist";
+        if (item.video_id.empty() || item.title.empty()) continue;
+        results.push_back(std::move(item));
+    }
+    return results;
+}
+
+bool JellyfinSource::add_to_playlist(const std::string& playlist_id, const std::string& item_id,
+                                     std::string* error_out) {
+    if (!configured()) {
+        if (error_out) *error_out = "Jellyfin server not configured";
+        return false;
+    }
+    if (playlist_id.empty() || item_id.empty()) {
+        if (error_out) *error_out = "empty playlist or item id";
+        return false;
+    }
+
+    // POST /Playlists/{playlist_id}/Items?Ids=<item_id>. Server-side this
+    // auto-expands container ids (Album/MusicArtist/Playlist) into their
+    // Audio children, so sending one hovered item id adds the whole album,
+    // or just the single track when it's an Audio item. 204 = success.
+    std::string url = base_url_ + "/Playlists/" + url_encode(playlist_id) +
+                      "/Items?Ids=" + url_encode(item_id);
+    std::string body, err;
+    if (!http_raw(url, auth_header(), insecure_, "POST", "", body, err)) {
+        if (error_out) *error_out = err;
+        return false;
+    }
+    return true;
 }
 
 // =====================================================================

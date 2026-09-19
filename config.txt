@@ -121,10 +121,7 @@ ListSeparator="|"
 HKeySetting="s"
 
 # Local Music Paths
-LocalMusicPath=/data/data/com.termux/files/home/disk/Download
-LocalMusicPath=~/disk/Music
-LocalMusicPath=~/music
-LocalMusicPath=~/Music
+LocalMusicPath=/home/pietroa/Musica
 
 ##-------------------------------------------
 ##             JELLYFIN SERVER
@@ -154,7 +151,11 @@ HKeySeekBackward="ARROW_KEY_LEFT"
 HKeyIncreaseVolume="1"
 HKeyDecreaseVolume="2"
 HKeyAddHoveringSongToQueue="a"
+HKeyAppendToQueue="z"
+HKeyPlayList="o"
+HKeyClearQueue="x"
 HKeyRemoveHoveringSongFromQueue="d"
+HKeyAddHoveringSongToPlaylist="g"
 HKeySwitchBetweenCards="TAB"
 HKeyFilterForFolder="f"
 HKeyClearFilter="c"

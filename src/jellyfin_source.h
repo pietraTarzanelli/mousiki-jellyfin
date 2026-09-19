@@ -28,9 +28,18 @@ struct SongResult {
     bool from_cache = false;
 };
 
-// Talks to a Jellyfin server through its native REST API only (no Subsonic,
-// no plugins). Authentication is a static API key sent as the
-// `Authorization: MediaBrowser Token="<key>"` header on every request.
+// Scope for an online search (Task 5). The scope is mapped server-side to
+// the `includeItemTypes` value in the Search/Hints request, so the results
+// are filtered by the server, not client-side: All = Audio,MusicAlbum,
+// Playlist plus the separate MusicArtist pass (the classic combined
+// search); the typed scopes (Playlist/Artist/Album) each include ONLY
+// that one type.
+enum class OnlineSearchScope {
+    All,       // default / s:  — tracks + albums + playlists + artists
+    Playlist,  // p:            — playlists only (empty p: == list all)
+    Artist,    // a:            — artists only (no songs, no albums)
+    Album,     // b:            — albums only
+};
 class JellyfinSource {
 public:
     explicit JellyfinSource(CacheManager& cache) : cache_(cache) {}
@@ -48,8 +57,16 @@ public:
     // have to come from a separate request). Only "MusicArtist" hints are
     // kept (raw "Person" people are dropped). type = one of "Audio",
     // "Album", "Playlist", "MusicArtist".
+    //
+    // With a non-All `scope` the search is narrowed server-side to exactly
+    // that one type (single request, no Artist second pass): Playlist ->
+    // Playlist hints, Artist -> MusicArtist only (raw Person dropped),
+    // Album -> MusicAlbum hints. An empty query with scope Playlist falls
+    // back to list_playlists() (the same request the add-to-playlist
+    // picker uses), so a bare "/p:" lists every playlist.
     std::vector<OnlineResult> search(const std::string& query, int count = 50,
-                                     std::string* error_out = nullptr);
+                                     std::string* error_out = nullptr,
+                                     OnlineSearchScope scope = OnlineSearchScope::All);
 
     // GET /Items?ParentId=<id>&UserId=<user>&IncludeItemTypes=Audio: the
     // track list inside an album or playlist container. Also used to poke
@@ -64,6 +81,16 @@ public:
     std::vector<OnlineResult> list_artist_tracks(const std::string& artist_id,
                                                  std::string* error_out = nullptr);
 
+    // GET /Items?IncludeItemTypes=Audio&Recursive=true&SortBy=DateCreated
+    // &SortOrder=Descending&StartIndex=<start>&Limit=<limit>: the whole
+    // music library, newest-added first. `limit`/`start_index` paginate
+    // (the app loads the list lazily as the user scrolls). `total_out`
+    // receives the server's TotalRecordCount so callers know whether more
+    // pages exist.
+    std::vector<OnlineResult> list_recent(int limit, int start_index,
+                                          int* total_out = nullptr,
+                                          std::string* error_out = nullptr);
+
     // GET /Items/{id} for the container/metadata, then downloads
     // GET /Audio/{id}/stream into the cache (downloaded-once, like the
     // old yt-dlp cache) so the existing ffprobe → ffmpeg-decode → Player
@@ -71,6 +98,21 @@ public:
     // intact.
     std::optional<SongResult> resolve_by_id(const std::string& item_id, const std::string& title,
                                             const std::string& artist, std::string* error_out = nullptr);
+
+    // GET /Items?IncludeItemTypes=Playlist&Recursive=true (user-scoped):
+    // the user's Jellyfin playlists, as container rows. Used both to
+    // display an "add to playlist" target list and (indirectly, through
+    // resolve_container_children) to expand one into its tracks.
+    std::vector<OnlineResult> list_playlists(std::string* error_out = nullptr);
+
+    // POST /Playlists/{playlist_id}/Items?Ids={item_id}&UserId=... -- adds
+    // a single item to a playlist. Jellyfin auto-expands container ids
+    // (Album/MusicArtist/Playlist → their Audio children) server-side, so
+    // passing one album/artist/playlist id adds the whole container. The
+    // server responds 204 No Content when the item was already a member or
+    // the container expanded successfully.
+    bool add_to_playlist(const std::string& playlist_id, const std::string& item_id,
+                         std::string* error_out = nullptr);
 
     // GET /Audio/{id}/Lyrics (Jellyfin 10.9+) and converts the LyricDto
     // (line timestamps + optional ELRC word cues, both in 100ns ticks)

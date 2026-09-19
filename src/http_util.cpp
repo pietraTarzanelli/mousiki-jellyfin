@@ -79,4 +79,24 @@ bool http_download_to_file(const std::string& url, const std::string& auth_heade
     return true;
 }
 
+bool http_raw(const std::string& url, const std::string& auth_header, bool insecure,
+              const std::string& method, const std::string& data,
+              std::string& out, std::string& err) {
+    std::string cmd = "curl -sS --fail-with-body --max-time 120 --retry 1 --retry-delay 1";
+    if (insecure) cmd += " --insecure";
+    cmd += " -X " + shell_quote(method);
+    cmd += " -H " + shell_quote(auth_header);
+    cmd += " -H 'Accept: application/json'";
+    if (!data.empty()) cmd += " -d " + shell_quote(data);
+    cmd += " " + shell_quote(url);
+    ProcResult r = run_capture(cmd, /*merge_stderr=*/true);
+    out = r.out;
+    if (r.ok()) return true;
+    err = "HTTP " + method + " failed (curl exit " + std::to_string(r.exit_code) + ")";
+    if (!r.out.empty()) {
+        err += ": " + r.out.substr(0, std::min<size_t>(r.out.size(), 200));
+    }
+    return false;
+}
+
 } // namespace muisc

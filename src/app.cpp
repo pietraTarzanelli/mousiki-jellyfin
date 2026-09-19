@@ -1,6 +1,7 @@
 #include "app.h"
 #include "utf8_util.h"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -22,6 +23,14 @@ std::string lower(std::string s) {
 
 bool contains_ci(const std::string& hay, const std::string& needle) {
     return lower(hay).find(lower(needle)) != std::string::npos;
+}
+
+// A Jellyfin result row that expands into a track list instead of being a
+// playable item itself (albums may come back as "Album" from some servers
+// or "MusicAlbum" from others — both are the same drillable container).
+bool is_container_type(const std::string& type) {
+    return type == "Album" || type == "MusicAlbum" ||
+           type == "Playlist" || type == "MusicArtist";
 }
 
 std::vector<std::string> split_words(const std::string& s) {
@@ -336,9 +345,9 @@ App::App() {
     jellyfin_.configure(settings_.jellyfin_server_url, settings_.jellyfin_api_key,
                         settings_.jellyfin_skip_cert_check);
     
-    // Inject the cache directory into local music paths so streamed songs
-    // automatically appear in the local view for seamless offline playback
-    settings_.local_music_paths.push_back(cache_.cache_dir().string());
+    // Local content stays purely in the configured music folder(s) — the
+    // Jellyfin download cache is deliberately not injected here anymore, so
+    // the /l: local search lists real local files only.
     
     all_local_tracks_ = local_source_.scan(settings_.local_music_paths);
     local_view_ = all_local_tracks_;
@@ -471,16 +480,23 @@ void App::update_live_search_preview() {
     while (!buf.empty() && buf.front() == ' ') buf.erase(buf.begin());
     while (!buf.empty() && buf.back() == ' ') buf.pop_back();
 
-    if (buf.size() >= 2 && lower(buf.substr(0, 2)) == "s:") {
-        list_source_ = pre_search_list_source_;
-        local_view_ = filter_and_rank_local(pre_search_local_query_);
+    if (buf.size() >= 2 && lower(buf.substr(0, 2)) == "l:") {
+        // /l: prefix → live-filtered local search against ~/Musica only.
+        std::string q = buf.substr(2);
+        while (!q.empty() && q.front() == ' ') q.erase(q.begin());
+        list_source_ = ListSource::Local;
+        local_view_ = filter_and_rank_local(q);
         selected_ = 0;
         scroll_ = 0;
         return;
     }
 
-    list_source_ = ListSource::Local;
-    local_view_ = filter_and_rank_local(buf);
+    // Anything else is a Jellyfin query (the default). It's not fired
+    // until Enter — a network request per keystroke would be wasteful and
+    // slow — so reset the view back to whatever it was before '/' was
+    // pressed to avoid a stale local preview lingering behind the search box.
+    list_source_ = pre_search_list_source_;
+    local_view_ = filter_and_rank_local(pre_search_local_query_);
     selected_ = 0;
     scroll_ = 0;
 }
@@ -491,22 +507,52 @@ void App::submit_search() {
     while (!buf.empty() && buf.front() == ' ') buf.erase(buf.begin());
     while (!buf.empty() && buf.back() == ' ') buf.pop_back();
 
-    if (buf.size() >= 2 && lower(buf.substr(0, 2)) == "s:") {
+    if (buf.size() >= 2 && lower(buf.substr(0, 2)) == "l:") {
+        // /l: → local search against ~/Musica.
         std::string query = buf.substr(2);
         while (!query.empty() && query.front() == ' ') query.erase(query.begin());
-        last_online_query_ = query;
-        online_breadcrumb_.clear();
-        list_source_ = ListSource::Online;
-        if (search_in_progress_.load()) {
-            status_line_ = "still searching, hang on ...";
-            return;
-        }
-        launch_search_async(query.empty() ? "music" : query);
-    } else {
-        last_local_query_ = buf;
+        last_local_query_ = query;
         list_source_ = ListSource::Local;
+        online_is_recent_ = false;
         refresh_local_view();
+        return;
     }
+
+    // Scoped Jellyfin searches (Task 5): /p: = playlists only, /a: =
+    // artists only, /b: = albums only. The scope rides on
+    // launch_search_async and is carried in the search-bar breadcrumb
+    // (/"+last_online_query_), and an empty p:/a:/b: query means "list all
+    // of that type".
+    OnlineSearchScope scope = OnlineSearchScope::All;
+    std::string scope_prefix;
+    std::string query = buf;
+    if (query.size() >= 2) {
+        std::string pfx = lower(query.substr(0, 2));
+        if (pfx == "p:") { scope = OnlineSearchScope::Playlist; scope_prefix = "p:"; query = query.substr(2); }
+        else if (pfx == "a:") { scope = OnlineSearchScope::Artist; scope_prefix = "a:"; query = query.substr(2); }
+        else if (pfx == "b:") { scope = OnlineSearchScope::Album; scope_prefix = "b:"; query = query.substr(2); }
+        else if (pfx == "s:") { query = query.substr(2); } // s: is a legacy alias for the default combined scope
+    }
+    while (!query.empty() && query.front() == ' ') query.erase(query.begin());
+    last_online_query_ = scope_prefix + query;
+    online_search_scope_ = scope;
+    // Breadcrumb names the type being shown, so the scope stays obvious
+    // once the search box is closed.
+    switch (scope) {
+        case OnlineSearchScope::Playlist: online_breadcrumb_ = "PLAYLISTS"; break;
+        case OnlineSearchScope::Artist:   online_breadcrumb_ = "ARTISTS"; break;
+        case OnlineSearchScope::Album:    online_breadcrumb_ = "ALBUMS"; break;
+        default:                          online_breadcrumb_.clear(); break;
+    }
+    list_source_ = ListSource::Online;
+    if (search_in_progress_.load()) {
+        status_line_ = "still searching, hang on ...";
+        return;
+    }
+    // Only the default combined scope substitutes "music" for an empty
+    // query; a scoped Enter-with-empty-query intentionally stays empty (the
+    // server then lists the whole type, e.g. every playlist).
+    launch_search_async(scope == OnlineSearchScope::All ? (query.empty() ? "music" : query) : query, scope);
 }
 
 // ---------------------------------------------------------------------
@@ -780,17 +826,20 @@ void App::poll_pending_waveform() {
     waveform_reveal_start_ = std::chrono::steady_clock::now(); // starts the 700ms left-to-right reveal
 }
 
-void App::launch_search_async(const std::string& query) {
+void App::launch_search_async(const std::string& query, OnlineSearchScope scope) {
     if (search_thread_.joinable()) search_thread_.join();
     search_in_progress_ = true;
     search_ready_ = false;
     pending_search_error_.clear();
     online_fetch_kind_ = OnlineFetchKind::Search;
+    online_fetch_start_ = 0;
+    pending_search_total_ = 0;
+    queue_add_prepend_ = false;
     status_line_ = "searching jellyfin library\u2026";
 
-    search_thread_ = std::thread([this, query]() {
+    search_thread_ = std::thread([this, query, scope]() {
         std::string err;
-        auto results = jellyfin_.search(query, 50, &err);
+        auto results = jellyfin_.search(query, 50, &err, scope);
         std::lock_guard<std::mutex> lk(search_mutex_);
         pending_search_results_ = std::move(results);
         pending_search_error_ = std::move(err);
@@ -804,6 +853,10 @@ void App::launch_browse_async(const std::string& item_id, const std::string& tit
     search_ready_ = false;
     pending_search_error_.clear();
     online_fetch_kind_ = OnlineFetchKind::Browse;
+    online_fetch_start_ = 0;
+    pending_search_total_ = 0;
+    queue_add_prepend_ = false;
+    online_search_scope_ = OnlineSearchScope::All; // drill-ins are never scope-typed
     online_breadcrumb_ = title;
     status_line_ = "loading \"" + title + "\" ...";
 
@@ -824,6 +877,8 @@ void App::launch_queue_async(const std::string& item_id, const std::string& titl
     search_ready_ = false;
     pending_search_error_.clear();
     online_fetch_kind_ = OnlineFetchKind::QueueAdd;
+    online_fetch_start_ = 0;
+    pending_search_total_ = 0;
     status_line_ = "adding \"" + title + "\" to queue ...";
 
     search_thread_ = std::thread([this, item_id, is_artist]() {
@@ -837,43 +892,235 @@ void App::launch_queue_async(const std::string& item_id, const std::string& titl
     });
 }
 
+void App::launch_recent_async(int start_index) {
+    if (search_thread_.joinable()) search_thread_.join();
+    search_in_progress_ = true;
+    search_ready_ = false;
+    pending_search_error_.clear();
+    online_fetch_kind_ = OnlineFetchKind::Recent;
+    online_fetch_start_ = start_index;
+    pending_search_total_ = 0;
+    queue_add_prepend_ = false;
+    online_search_scope_ = OnlineSearchScope::All; // library listing is never scope-typed
+    status_line_ = start_index == 0 ? "loading jellyfin library\u2026" : "loading more\u2026";
+
+    search_thread_ = std::thread([this, start_index]() {
+        std::string err;
+        int total = 0;
+        auto results = jellyfin_.list_recent(kOnlinePageSize, start_index, &total, &err);
+        std::lock_guard<std::mutex> lk(search_mutex_);
+        pending_search_results_ = std::move(results);
+        pending_search_error_ = std::move(err);
+        pending_search_total_ = total;
+        search_ready_ = true;
+    });
+}
+
+void App::launch_playlist_pick_async() {
+    if (search_thread_.joinable()) search_thread_.join();
+    search_in_progress_ = true;
+    search_ready_ = false;
+    pending_search_error_.clear();
+    online_fetch_kind_ = OnlineFetchKind::PlaylistPick;
+    online_fetch_start_ = 0;
+    pending_search_total_ = 0;
+    queue_add_prepend_ = false;
+    status_line_ = "loading playlists\u2026";
+
+    search_thread_ = std::thread([this]() {
+        std::string err;
+        auto results = jellyfin_.list_playlists(&err);
+        std::lock_guard<std::mutex> lk(search_mutex_);
+        pending_search_results_ = std::move(results);
+        pending_search_error_ = std::move(err);
+        search_ready_ = true;
+    });
+}
+
+void App::launch_playlist_add_async(const std::string& playlist_id) {
+    if (search_thread_.joinable()) search_thread_.join();
+    search_in_progress_ = true;
+    search_ready_ = false;
+    pending_search_error_.clear();
+    online_fetch_kind_ = OnlineFetchKind::PlaylistAdd;
+    online_fetch_start_ = 0;
+    pending_search_total_ = 0;
+    queue_add_prepend_ = false;
+    status_line_ = "adding \"" + pending_playlist_item_.title + "\" to playlist\u2026";
+
+    search_thread_ = std::thread([this, playlist_id]() {
+        std::string err;
+        bool ok = jellyfin_.add_to_playlist(playlist_id, pending_playlist_item_.video_id, &err);
+        std::lock_guard<std::mutex> lk(search_mutex_);
+        pending_search_results_.clear();
+        pending_search_error_ = ok ? "" : std::move(err);
+        // Reuse pending_search_total_ to carry success through the shared
+        // fetch state (0 = success, 1 = error, like the rest of poll routing).
+        pending_search_total_ = ok ? 0 : 1;
+        search_ready_ = true;
+    });
+}
+
+// Puts the browse list back to exactly what it was before 'g' opened the
+// playlist picker (used after a successful add and on Esc-cancel).
+void App::restore_playlist_pick_view() {
+    online_view_ = std::move(pre_pick_view_);
+    selected_ = pre_pick_selected_;
+    scroll_ = pre_pick_scroll_;
+    online_breadcrumb_ = pre_pick_breadcrumb_;
+    online_is_recent_ = pre_pick_is_recent_;
+    online_total_ = pre_pick_total_;
+    online_next_start_ = pre_pick_next_start_;
+    online_has_more_ = pre_pick_has_more_;
+    online_loading_more_ = pre_pick_loading_more_;
+    playlist_pick_active_ = false;
+}
+
 void App::poll_pending_search() {
     if (!search_ready_.load()) return;
     std::vector<OnlineResult> results;
     std::string error;
+    int total = 0;
     {
         std::lock_guard<std::mutex> lk(search_mutex_);
         results = std::move(pending_search_results_);
         error = std::move(pending_search_error_);
+        total = pending_search_total_;
+        pending_search_total_ = 0;
     }
     search_ready_ = false;
     search_in_progress_ = false;
     OnlineFetchKind kind = online_fetch_kind_;
     online_fetch_kind_ = OnlineFetchKind::Search;
+    int start = online_fetch_start_;
+    online_fetch_start_ = 0;
 
     if (!error.empty() && results.empty()) {
+        if (kind == OnlineFetchKind::PlaylistAdd) {
+            // A failed add must still pop the picker back to the browse list.
+            status_line_ = error;
+            restore_playlist_pick_view();
+            return;
+        }
         status_line_ = error;
-        online_view_.clear();
+        if (kind == OnlineFetchKind::Recent && start == 0) {
+            online_view_.clear();
+            online_is_recent_ = false;
+            online_has_more_ = false;
+            online_loading_more_ = false;
+            startup_autoplay_pending_ = false;
+        }
         return;
     }
 
     if (kind == OnlineFetchKind::QueueAdd) {
         // Don't touch the on-screen list — dump the tracks into the queue.
-        for (auto& r : results) {
-            queue_.push_back({false, r.title, r.uploader, {}, r.video_id});
+        bool at_start = queue_add_prepend_;
+        queue_add_prepend_ = false;
+        if (at_start) {
+            // Prepend the whole container as a block in album order: the
+            // first fetched track must land at the head, so insert reversed.
+            for (auto it = results.rbegin(); it != results.rend(); ++it) {
+                queue_.insert(queue_.begin(), QueueItem{false, it->title, it->uploader, {}, it->video_id});
+            }
+        } else {
+            for (auto& r : results) {
+                queue_.push_back({false, r.title, r.uploader, {}, r.video_id});
+            }
         }
         clamp_queue_selected();
-        status_line_ = results.empty() ? "no tracks in that playlist/album" : "added " + std::to_string(results.size()) + " tracks to queue";
+        status_line_ = results.empty() ? "no tracks in that playlist/album"
+                                       : std::string("added ") + std::to_string(results.size()) + " tracks to queue" +
+                                         (at_start ? " (at start)" : "");
         return;
     }
 
+    if (kind == OnlineFetchKind::PlaylistPick) {
+        // The picker list replaces the browse list in the same panel; keep
+        // the breadcrumb focused on the action ("CHOOSE PLAYLIST") and let
+        // build_list_panel render the playlists as normal rows.
+        online_view_ = std::move(results);
+        selected_ = 0;
+        scroll_ = 0;
+        online_breadcrumb_ = "CHOOSE PLAYLIST";
+        online_is_recent_ = false;
+        online_has_more_ = false;
+        status_line_ = online_view_.empty()
+                           ? "no playlists on the server"
+                           : "playlists loaded \u2191\u2193=select ENTER=add ESC=cancel";
+        return;
+    }
+
+    if (kind == OnlineFetchKind::PlaylistAdd) {
+        // The POST result lands here without any list swap.
+        bool ok = (total == 0);
+        if (ok) {
+            status_line_ = "added \"" + pending_playlist_item_.title + "\" to playlist \"" +
+                           pending_playlist_name_ + "\"";
+        } else {
+            status_line_ = error.empty() ? "could not add to playlist" : error;
+        }
+        restore_playlist_pick_view();
+        return;
+    }
+
+    if (kind == OnlineFetchKind::Recent) {
+        online_is_recent_ = true;
+        online_total_ = (total > 0) ? total : static_cast<int>(online_view_.size() + results.size());
+        if (start == 0) {
+            online_view_ = std::move(results);
+            selected_ = 0;
+            scroll_ = 0;
+            online_breadcrumb_ = "JELLYFIN LIBRARY (recent)";
+        } else {
+            online_view_.insert(online_view_.end(), results.begin(), results.end());
+        }
+        online_next_start_ = static_cast<int>(online_view_.size());
+        online_has_more_ = online_next_start_ < online_total_;
+        online_loading_more_ = false;
+        status_line_.clear();
+
+        if (startup_autoplay_pending_ && !online_view_.empty()) {
+            startup_autoplay_pending_ = false;
+            settings_.play_mode = 2; // shuffle on launch
+            play_relative_random();
+        } else if (online_view_.empty()) {
+            status_line_ = "no tracks in jellyfin library";
+        }
+        return;
+    }
+
+    online_is_recent_ = false;
     online_view_ = std::move(results);
     selected_ = 0;
     scroll_ = 0;
-    if (online_breadcrumb_.empty()) {
-        status_line_ = online_view_.empty() ? "no jellyfin results" : "";
-    } else if (online_view_.empty()) {
-        status_line_ = "no tracks in \"" + online_breadcrumb_ + "\"";
+    if (online_view_.empty()) {
+        switch (online_search_scope_) {
+            case OnlineSearchScope::Playlist: status_line_ = "no playlists found"; break;
+            case OnlineSearchScope::Artist:   status_line_ = "no artists found"; break;
+            case OnlineSearchScope::Album:    status_line_ = "no albums found"; break;
+            default:
+                status_line_ = online_breadcrumb_.empty() ? "no jellyfin results"
+                                                          : "no tracks in \"" + online_breadcrumb_ + "\"";
+        }
+    } else {
+        status_line_.clear();
+    }
+}
+
+// Loads the next lazy page of the whole-library "recent" listing when the
+// user has scrolled close to the bottom. Guarded on the single in-flight
+// remote fetch flag, so it never steps on an active search/browse.
+void App::maybe_load_online_more() {
+    if (list_source_ != ListSource::Online || !online_is_recent_ ||
+        !online_has_more_ || online_loading_more_ || search_in_progress_.load()) {
+        return;
+    }
+    int total = static_cast<int>(online_view_.size());
+    if (total == 0) return;
+    if (scroll_ + kListVisibleRows + kOnlinePageSize / 2 >= total) {
+        online_loading_more_ = true;
+        launch_recent_async(online_next_start_);
     }
 }
 
@@ -962,21 +1209,62 @@ void App::advance_track() {
     }
 }
 
-void App::queue_add_selected() {
+void App::queue_add_selected(bool at_start) {
     size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
     if (list_len == 0 || selected_ < 0 || selected_ >= static_cast<int>(list_len)) return;
     if (list_source_ == ListSource::Local) {
         const auto& t = local_view_[selected_];
-        queue_.push_back({true, t.title, t.folder_artist, t.path, ""});
+        QueueItem item{true, t.title, t.folder_artist, t.path, ""};
+        if (at_start) queue_.insert(queue_.begin(), item);
+        else queue_.push_back(item);
     } else {
         const auto& r = online_view_[selected_];
-        if (r.type == "Album" || r.type == "Playlist" || r.type == "MusicArtist") { // add the whole container, not just one slot
+        if (r.type == "Album" || r.type == "MusicAlbum" || r.type == "Playlist" || r.type == "MusicArtist") { // add the whole container, not just one slot
+            queue_add_prepend_ = at_start;
             launch_queue_async(r.video_id, r.title, r.type == "MusicArtist");
             return;
         }
-        queue_.push_back({false, r.title, r.uploader, {}, r.video_id});
+        QueueItem item{false, r.title, r.uploader, {}, r.video_id};
+        if (at_start) queue_.insert(queue_.begin(), item);
+        else queue_.push_back(item);
     }
     clamp_queue_selected();
+}
+
+void App::play_list() {
+    // 'o' — "play this list from here": rebuild the queue as everything
+    // from the selection onward (in order) and start playing the
+    // selection right now. Container rows can't occupy a queue slot, so
+    // they're skipped.
+    size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
+    if (list_len == 0 || selected_ < 0 || selected_ >= static_cast<int>(list_len)) return;
+    std::vector<QueueItem> rest;
+    QueueItem first;
+    bool have_first = false;
+    for (size_t i = static_cast<size_t>(selected_); i < list_len; ++i) {
+        QueueItem item;
+        if (list_source_ == ListSource::Local) {
+            const auto& t = local_view_[i];
+            item = {true, t.title, t.folder_artist, t.path, ""};
+        } else {
+            const auto& r = online_view_[i];
+            if (is_container_type(r.type)) continue;
+            item = {false, r.title, r.uploader, {}, r.video_id};
+        }
+        if (!have_first) { first = item; have_first = true; }
+        else rest.push_back(std::move(item));
+    }
+    if (!have_first) return;
+    queue_ = std::move(rest);
+    clamp_queue_selected();
+    if (list_source_ == ListSource::Local) {
+        LocalTrack t{fs::path(first.local_path).stem().string(), first.local_path, first.artist};
+        start_local_track(t);
+    } else {
+        OnlineResult r{first.video_id, first.title, first.artist};
+        start_online_track(r);
+    }
+    status_line_ = "play-list: " + std::to_string(rest.size() + 1) + " tracks from here";
 }
 
 void App::queue_remove_last() {
@@ -1014,8 +1302,10 @@ static const char* kRefHotkeyNames[] = {
     "HKeySetting", "HKeyNavigateUp", "HKeyNavigateDown", "HKeyPlay", "HKeyPlayNextSong",
     "HKeyPlayPreviousSong", "HKeyToggleRepeat", "HKeyToggleShuffle", "HKeySearch",
     "HKeySearchOnline", "HKeyQuit",
+    "HKeyAddHoveringSongToQueue", "HKeyAppendToQueue", "HKeyPlayList", "HKeyClearQueue",
+    "HKeyAddHoveringSongToPlaylist",
 };
-static constexpr int kRefRowCount = 11;
+static constexpr int kRefRowCount = 16;
 
 std::string* App::color_field_ptr(int row, int col) {
     switch (row) {
@@ -1049,7 +1339,7 @@ int App::settings_max_row() const {
         case 3: {
             int letters = 0;
             for (char c = 'A'; c <= 'Z'; ++c) if (settings_.font_map.count(c)) ++letters;
-            return kRefRowCount + letters - 1; // 11 hotkeys + N font-map rows
+            return kRefRowCount + letters - 1; // hotkeys + N font-map rows
         }
         case 4: {
             int MAX_Y = std::max(main_frame_height(80) - 2, 10);
@@ -1255,7 +1545,7 @@ void App::start_local_track(const LocalTrack& track) {
 void App::start_online_track(const OnlineResult& result) {
     // Album/playlist/artist hits aren't audio — drill into their track
     // list instead of trying to play them.
-    if (result.type == "Album" || result.type == "Playlist" || result.type == "MusicArtist") {
+    if (is_container_type(result.type)) {
         if (search_in_progress_.load()) { status_line_ = "still loading, hang on ..."; return; }
         launch_browse_async(result.video_id, result.title, result.type == "MusicArtist");
         return;
@@ -1391,9 +1681,56 @@ void App::handle_key(int key) {
         case 'b': // prev song (within current list)
             play_relative(-1);
             break;
-        case 'a': // add selected to queue
-            queue_add_selected();
+        case 'a': // add selected to the START of the queue
+            queue_add_selected(true);
+            status_line_ = "added at start";
+            break;
+        case 'z': // add selected to the END of the queue
+            queue_add_selected(false);
             status_line_ = "added to queue";
+            break;
+        case 'g': case 'G': // add the hovering jellyfin item to a playlist (Task 3)
+            if (playlist_pick_active_) {
+                // Already picking: 'g' does nothing, Esc ends it.
+                status_line_ = "pick a playlist with ENTER, ESC to cancel";
+            } else if (list_source_ != ListSource::Online ||
+                       online_view_.empty() || selected_ < 0 ||
+                       selected_ >= static_cast<int>(online_view_.size())) {
+                status_line_ = "playlist-add needs a jellyfin item";
+            } else if (search_in_progress_.load()) {
+                status_line_ = "still loading, hang on ...";
+            } else {
+                // Snapshot the current browse list so Enter/Esc can restore
+                // it, then open the playlists picker in the same panel.
+                pending_playlist_item_ = online_view_[selected_];
+                pre_pick_view_ = online_view_;
+                pre_pick_selected_ = selected_;
+                pre_pick_scroll_ = scroll_;
+                pre_pick_breadcrumb_ = online_breadcrumb_;
+                pre_pick_is_recent_ = online_is_recent_;
+                pre_pick_total_ = online_total_;
+                pre_pick_next_start_ = online_next_start_;
+                pre_pick_has_more_ = online_has_more_;
+                pre_pick_loading_more_ = online_loading_more_;
+                playlist_pick_active_ = true;
+                launch_playlist_pick_async();
+            }
+            break;
+        case 'o': case 'O': // play the rest of the current list from the selection
+            {
+                size_t list_len = (list_source_ == ListSource::Local) ? local_view_.size() : online_view_.size();
+                if (list_len == 0) status_line_ = "nothing to play";
+                else play_list();
+            }
+            break;
+        case 'm': case 'M': // toggle shuffle
+            settings_.play_mode = (settings_.play_mode == 2) ? 0 : 2;
+            status_line_ = settings_.play_mode == 2 ? "shuffle: on" : "shuffle: off";
+            break;
+        case 'x': case 'X': // clear the whole queue
+            queue_.clear();
+            clamp_queue_selected();
+            status_line_ = "queue cleared";
             break;
         case 'd': // remove last queued item
             queue_remove_last();
@@ -1463,6 +1800,19 @@ void App::handle_key(int key) {
             break;
         case '\r': case '\n':
             if (queue_focus_ && !queue_.empty()) play_from_queue(queue_selected_);
+            else if (playlist_pick_active_ && list_source_ == ListSource::Online &&
+                     !online_view_.empty() && selected_ >= 0 &&
+                     selected_ < static_cast<int>(online_view_.size()) &&
+                     online_view_[selected_].type == "Playlist") {
+                // Enter on a playlist row -> add the pending item to it.
+                const auto& picked = online_view_[selected_];
+                pending_playlist_name_ = picked.title;
+                if (search_in_progress_.load()) {
+                    status_line_ = "still loading, hang on ...";
+                } else {
+                    launch_playlist_add_async(picked.video_id);
+                }
+            }
             else play_selected();
             break;
         case '/':
@@ -1476,17 +1826,27 @@ void App::handle_key(int key) {
                  // filter, from the top. Same destination regardless of
                  // how buried you are (mid search results, viewing
                  // online results, scrolled deep into the list).
+            if (playlist_pick_active_) {
+                // Cancelling the playlist picker returns exactly to the
+                // browse list that was showing before 'g' was pressed.
+                restore_playlist_pick_view();
+                status_line_ = "playlist-add cancelled";
+                break;
+            }
             list_source_ = ListSource::Local;
             last_local_query_.clear();
             refresh_local_view();
             status_line_.clear();
             break;
-        case 'r': case 'R': // force a full redraw -- for when a resize
-                             // raced the render loop and left a torn/
-                             // stale frame on screen. hard_clear is
-                             // normally only set on a detected width or
-                             // mode change; this forces it once
-                             // unconditionally on the very next frame.
+case 'r': case 'R': // toggle repeat (single-track loop)
+            settings_.play_mode = (settings_.play_mode == 1) ? 0 : 1;
+            status_line_ = settings_.play_mode == 1 ? "repeat: on (loop this track)" : "repeat: off";
+            break;
+        case 12: // Ctrl+L — force a full redraw -- for when a resize raced
+                 // the render loop and left a torn/stale frame on screen.
+                 // hard_clear is normally only set on a detected width or
+                 // mode change; this forces it once unconditionally on the
+                 // very next frame. (Was 'r' before 'r' became repeat.)
             force_redraw_ = true;
             break;
         case 'q': case 'Q':
@@ -1993,16 +2353,30 @@ std::vector<std::string> App::build_progress_panel(int total_width) const {
     return out;
 }
 std::vector<std::string> App::build_search_bar(int total_width) const {
-    std::string label = (list_source_ == ListSource::Online) ? "SEARCH JELLYFIN" : "SEARCH LOCAL";
+    // Jellyfin is the default source; /l: is the local-search prefix.
+    // A committed p:/a:/b: scope is reflected in the label and the bar
+    // content (which keeps the prefix, e.g. "/p:gan"), so the scope stays
+    // visible even after the search box closes.
+    std::string label;
+    if (list_source_ == ListSource::Local) {
+        label = "SEARCH LOCAL (/l:)";
+    } else {
+        switch (online_search_scope_) {
+            case OnlineSearchScope::Playlist: label = "SEARCH PLAYLISTS (/p:)"; break;
+            case OnlineSearchScope::Artist:   label = "SEARCH ARTISTS (/a:)"; break;
+            case OnlineSearchScope::Album:    label = "SEARCH ALBUMS (/b:)"; break;
+            default:                          label = "SEARCH JELLYFIN (DEFAULT)"; break;
+        }
+    }
 
     std::string content;
     if (mode_ == Mode::Search) {
         size_t cur = std::min(search_cursor_, search_buffer_.size());
         content = "/" + search_buffer_.substr(0, cur) + "\u2588" + search_buffer_.substr(cur);
-    } else if (list_source_ == ListSource::Online) {
-        content = "/s:" + last_online_query_;
-    } else {
+    } else if (list_source_ == ListSource::Local) {
         content = "/l:" + last_local_query_;
+    } else {
+        content = "/" + last_online_query_;
     }
 
     std::string border_ansi = ansi_for(settings_.border_color, false);
@@ -2040,7 +2414,8 @@ std::vector<std::string> App::build_list_panel(int total_width, int height) cons
                 std::string t_idx = apply_font_map(std::to_string(idx + 1), settings_.font_map);
                 std::string t_title = apply_font_map(r.title, settings_.font_map);
                 std::string side;
-                if (r.type == "Album" || r.type == "Playlist") side = r.type;
+                if (r.type == "Album" || r.type == "MusicAlbum") side = "Album";
+                else if (r.type == "Playlist") side = r.type;
                 else if (r.type == "MusicArtist") side = "ARTIST";
                 else side = r.uploader;
                 std::string t_uploader = apply_font_map(side, settings_.font_map);
@@ -2166,6 +2541,7 @@ int App::main_frame_height(int w) const {
     h += kListVisibleRows;
     h += 1; // blank separator line
     h += 1; // status/loading line -- reserved even when currently empty, so this doesn't jitter frame to frame
+    h += static_cast<int>(build_keybind_hint().size()); // hint line(s)
     return h;
 }
 
@@ -2305,16 +2681,18 @@ void App::build_settings_screen(std::ostringstream& frame, int W, int player_h) 
             y++;
         }
     } else if (settings_tab_ == 3) {
-        // Reference tab: the 11 editable hotkeys, then a blank divider,
+        // Reference tab: the editable hotkeys, then a blank divider,
         // then a read-only display of the font-mapping table (section 4
         // of the config, "A={A,a}" style) loaded from config.txt -- as
         // "A = A, a" rows. Combined they're usually taller than the
         // player view, so this scrolls as one list (viewport follows
         // settings_row_, centered) rather than ever growing the panel
         // past player_h.
-        static const char* ref_l[kRefRowCount] = {"Open Settings", "Navigate Up", "Navigate Down", "Play / Pause",
-                                                    "Next Track", "Prev Track", "Toggle Repeat", "Toggle Shuffle",
-                                                    "Search Local", "Search Jellyfin", "Quit Application"};
+static const char* ref_l[kRefRowCount] = {"Open Settings", "Navigate Up", "Navigate Down", "Play / Pause",
+                                                     "Next Track", "Prev Track", "Toggle Repeat", "Toggle Shuffle",
+                                                     "Search Local", "Search Jellyfin", "Quit Application",
+                                                     "Add At Start", "Append To Queue", "Play List From Here",
+                                                     "Clear Queue", "Add To Playlist"};
         std::vector<char> letters;
         for (char c = 'A'; c <= 'Z'; ++c) if (settings_.font_map.count(c)) letters.push_back(c);
         int display_count = kRefRowCount + 1 + static_cast<int>(letters.size()); // +1 for the divider row
@@ -2393,6 +2771,98 @@ void App::build_settings_screen(std::ostringstream& frame, int W, int player_h) 
     }
 }
 // ---------------------------------------------------------------------
+// Keybinding hint line
+// ---------------------------------------------------------------------
+
+// Bottom-of-screen single-line help, driven by the configured hotkeys
+// (settings_.hotkeys), so rebinding a key in config.txt immediately
+// changes what the hint shows. Missing special-key sequences are mapped
+// to short labels (ARROW_KEY_UP -> ↑, etc.); single ASCII letters are
+// shown uppercase; everything else (digits, "/", ...) renders verbatim.
+// Returns two rows: row 1 = playback/navigation essentials, row 2 =
+// queue/play-list/playback-mode toggles.
+std::vector<std::string> App::build_keybind_hint() const {
+    auto key_label = [](const std::string& k) -> std::string {
+        if (k == "ARROW_KEY_UP") return "\u2191";
+        if (k == "ARROW_KEY_DOWN") return "\u2193";
+        if (k == "ARROW_KEY_RIGHT") return "\u2192";
+        if (k == "ARROW_KEY_LEFT") return "\u2190";
+        if (k == "ENTER") return "Enter";
+        if (k == "TAB") return "Tab";
+        if (k == "SPACE") return "Space";
+        if (k == "ESC") return "Esc";
+        if (k == "BACKSPACE") return "BS";
+        if (k.size() == 1 && (k[0] >= 'a' && k[0] <= 'z')) {
+            return std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(k[0]))));
+        }
+        return k;
+    };
+    auto key_of = [this](const std::string& action) {
+        auto it = settings_.hotkeys.find(action);
+        return it != settings_.hotkeys.end() ? it->second : std::string();
+    };
+    auto chunk = [&](const std::string& action, const std::string& label) -> std::string {
+        std::string k = key_of(action);
+        if (k.empty()) return "";
+        return "[" + key_label(k) + "=" + label + "]";
+    };
+    auto join = [](const std::vector<std::string>& parts, std::string& line) {
+        for (const auto& c : parts) {
+            if (c.empty()) continue;
+            if (!line.empty()) line += " ";
+            line += c;
+        }
+    };
+
+    std::string row1, row2;
+    join({chunk("HKeyTogglePlayPause", "play/pause"),
+          chunk("HKeyAddHoveringSongToQueue", "add-start"),
+          chunk("HKeyRemoveHoveringSongFromQueue", "remove")}, row1);
+    // Volume is a two-key action: group inc/dec as "1/2=vol".
+    {
+        std::string up = key_of("HKeyIncreaseVolume");
+        std::string down = key_of("HKeyDecreaseVolume");
+        if (!up.empty() || !down.empty()) {
+            std::string keys;
+            if (!up.empty()) keys += key_label(up);
+            if (!down.empty()) keys += (keys.empty() ? "" : "/") + key_label(down);
+            if (!row1.empty()) row1 += " ";
+            row1 += "[" + keys + "=vol]";
+        }
+    }
+    join({chunk("HKeyPlayNextSong", "next"),
+          chunk("HKeyPlayPreviousSong", "prev"),
+          chunk("HKeySearch", "search"),
+          chunk("HKeySwitchBetweenCards", "panels"),
+          chunk("HKeyQuit", "quit")}, row1);
+
+    join({chunk("HKeyPlayList", "play-list"),
+          chunk("HKeyAddHoveringSongToPlaylist", "add play-list"),
+          chunk("HKeyAppendToQueue", "append"),
+          chunk("HKeyToggleShuffle", "shuffle"),
+          chunk("HKeyToggleRepeat", "repeat"),
+          chunk("HKeyClearQueue", "clear queue")}, row2);
+
+    // Search-scope prefixes: typing these in the / box narrows the Jellyfin
+    // search to one type (p: playlists, a: artists, b: albums), with an
+    // empty query listing everything of that type. Shown on row 2 so the
+    // hint stays discoverable even for users who only ever press /+Enter.
+    join({"[p:playlists]", "[a:artists]", "[b:albums]"}, row2);
+
+    // The hint is two bottom rows. Row 2 is physical, not cleared between
+    // frames, so if it's ever shorter than row 1 the leftover glyphs from
+    // the line above peek through. Pad every row to the same length (the
+    // wider of the two) so each frame fully overwrites its line
+    // (user-specified fix).
+    auto rows = std::vector<std::string>{row1, row2};
+    size_t w = std::max(row1.size(), row2.size());
+    for (auto& r : rows) {
+        if (r.size() < w) r.append(w - r.size(), ' ');
+    }
+    return rows;
+}
+
+// ---------------------------------------------------------------------
 // Frame assembly
 // ---------------------------------------------------------------------
 
@@ -2467,6 +2937,10 @@ std::string App::render_frame(TerminalIO& term) {
         frame << "  " << status_line_ << "\n";
     }
 
+    auto hint_lines = build_keybind_hint();
+    for (const auto& h : hint_lines) {
+        frame << "  \x1b[90m" << truncate_str(h, std::max(0, W - 2)) << "\x1b[0m\n";
+    }
     frame << "\x1b[0J";
     return frame.str();
 }
@@ -2476,11 +2950,21 @@ std::string App::render_frame(TerminalIO& term) {
 // ---------------------------------------------------------------------
 
 int App::run() {
-    if (!local_view_.empty()) {
+    TerminalIO term;
+
+    // Jellyfin is the primary source: on startup, load the whole library
+    // (newest-first) into the list and autoplay a random track in shuffle.
+    // Falls back to the first local track only when Jellyfin isn't
+    // configured (the local library stays reachable via the /l: search).
+    if (jellyfin_.configured()) {
+        list_source_ = ListSource::Online;
+        startup_autoplay_pending_ = true;
+        launch_recent_async(0);
+    } else if (!local_view_.empty()) {
         selected_ = 0;
         start_local_track(local_view_[0]);
     }
-    TerminalIO term;
+
     last_frame_time_ = std::chrono::steady_clock::now();
 
     while (!quit_) {
@@ -2488,6 +2972,7 @@ int App::run() {
         handle_key(key);
 
         poll_pending_search();
+        maybe_load_online_more();
         poll_pending_load();
         poll_pending_waveform();
 

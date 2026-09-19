@@ -15,6 +15,14 @@ std::string url_encode(const std::string& s);
 bool http_get_json(const std::string& url, const std::string& auth_header,
                    bool insecure, std::string& out, std::string& err);
 
+// Generic request with an explicit HTTP method (GET/POST/DELETE/...).
+// `data` (optional) is the request body; curl sends it with
+// -d and the method via -X. Used for Jellyfin playlist mutations
+// (POST /Playlists/{id}/Items, DELETE /Items/{id}).
+bool http_raw(const std::string& url, const std::string& auth_header, bool insecure,
+              const std::string& method, const std::string& data,
+              std::string& out, std::string& err);
+
 // Downloads `url` to `dest` with curl -o (binary-safe, nothing captured on
 // stdout). Returns true only if curl exited 0 AND `dest` exists with a
 // nonzero size.
