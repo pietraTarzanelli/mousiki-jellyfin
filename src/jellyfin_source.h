@@ -126,12 +126,22 @@ private:
     std::string api_key_;
     bool insecure_ = true;
     std::string user_id_; // first user Discovered lazily for playlist children
+    std::string playlist_user_id_; // admin user id (playlist owner context) for mutations
 
     std::string auth_header() const;
 
     // GET /Users and remember the first user id (playlist item lists are
     // user-scoped). Returns empty string if it can't be discovered.
     std::string resolve_user_id();
+
+    // GET /Users and remember the id of the first Administrator (the
+    // account that owns the user playlists, e.g. "Pietro Parcheggiatore");
+    // falls back to the first user. The static API key is a system key
+    // (GET /Users/Me is null), and playlists are owned by a real user, so
+    // playlist mutations must carry an acting UserId that the server trusts
+    // — a non-owner user (like user[0]) gets 400/404. Returns empty string
+    // only if no user can be discovered at all.
+    std::string resolve_playlist_user_id();
 };
 
 } // namespace muisc

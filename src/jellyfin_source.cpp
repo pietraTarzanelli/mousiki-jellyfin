@@ -198,6 +198,38 @@ std::string JellyfinSource::resolve_user_id() {
     return user_id_;
 }
 
+std::string JellyfinSource::resolve_playlist_user_id() {
+    if (!playlist_user_id_.empty() || !configured()) return playlist_user_id_;
+
+    // The static API key is a system key with no bound user (/Users/Me is
+    // null), but playlists are owned by real accounts — and playlist
+    // mutations are only accepted when the acting UserId belongs to the
+    // owner (or an administrator). Prefer the first Administrator, since
+    // they can mutate every playlist; fall back to the first user and stop.
+    std::string url = base_url_ + "/Users";
+    std::string body, err;
+    if (!http_get_json(url, auth_header(), insecure_, body, err)) return {};
+
+    minijson::Value root;
+    if (!minijson::parse(body, root) || !root.is_array() || root.arr.empty()) return {};
+
+    const minijson::Value* fallback = nullptr;
+    for (const auto& u : root.arr) {
+        if (!u.is_object()) continue;
+        const minijson::Value* id = u.get("Id");
+        if (!id) continue;
+        if (fallback == nullptr) fallback = &u;
+        const minijson::Value* policy = u.get("Policy");
+        const minijson::Value* is_admin = policy ? policy->get("IsAdministrator") : nullptr;
+        if (is_admin && is_admin->type == minijson::Type::Bool && is_admin->b) {
+            playlist_user_id_ = id->as_string();
+            return playlist_user_id_;
+        }
+    }
+    if (fallback) playlist_user_id_ = fallback->get("Id")->as_string();
+    return playlist_user_id_;
+}
+
 std::vector<OnlineResult> JellyfinSource::list_children(const std::string& parent_id, std::string* error_out) {
     if (!configured()) {
         if (error_out) *error_out = "Jellyfin server not configured";
@@ -404,8 +436,13 @@ bool JellyfinSource::add_to_playlist(const std::string& playlist_id, const std::
     // auto-expands container ids (Album/MusicArtist/Playlist) into their
     // Audio children, so sending one hovered item id adds the whole album,
     // or just the single track when it's an Audio item. 204 = success.
+    // The server 400s "Error processing request" without the acting user:
+    // the static API key has no user bound, so the admin's id (the playlist
+    // owner context) has to ride along explicitly.
+    std::string uid = resolve_playlist_user_id();
     std::string url = base_url_ + "/Playlists/" + url_encode(playlist_id) +
                       "/Items?Ids=" + url_encode(item_id);
+    if (!uid.empty()) url += "&UserId=" + url_encode(uid);
     std::string body, err;
     if (!http_raw(url, auth_header(), insecure_, "POST", "", body, err)) {
         if (error_out) *error_out = err;
