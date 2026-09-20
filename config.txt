@@ -121,7 +121,7 @@ ListSeparator="|"
 HKeySetting="s"
 
 # Local Music Paths
-LocalMusicPath=/home/pietroa/Musica
+LocalMusicPath=~/Music
 
 ##-------------------------------------------
 ##             JELLYFIN SERVER
