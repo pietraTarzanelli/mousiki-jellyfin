@@ -1858,6 +1858,77 @@ case 'r': case 'R': // toggle repeat (single-track loop)
 }
 
 // ---------------------------------------------------------------------
+// Mouse input (Task 4): prev/play/next buttons, volume bar, waveform seek
+// ---------------------------------------------------------------------
+void App::handle_mouse(const MouseEvent& m, int term_cols) {
+    if (mode_ != Mode::Browse) return;
+    if (m.button != 0) return; // left-button press only — releases/wheel are swallowed and ignored
+    if (m.x <= 0 || m.y <= 0 || term_cols <= 0) return;
+
+    const int W = std::clamp(term_cols, 40, 200);
+    const int button_total_w = 13;
+    const int side_panel_w = settings_.element_dummy_buttons ? (button_total_w * 3) : 38;
+    const int main_total_w = std::max(24, W - side_panel_w);
+    const int wave_w = main_total_w - 4;
+
+    // Same vertical lay-out render_frame() produces: metadata panel on top,
+    // progress panel right below it. Inside the progress panel the rows are
+    // 0=top border, 1=wave+buttons, 2=wave, 3=wave+volume, 4=bottom line.
+    const int metadata_h = static_cast<int>(build_metadata_panel(W).size());
+    const int buttons_row = metadata_h + 2;
+    const int wave_rows_lo = metadata_h + 2;
+    const int wave_rows_hi = metadata_h + 4;
+    const int volume_row = metadata_h + 4;
+
+    // Player buttons: "<<<" / play/pause / ">>>".
+    if (m.y == buttons_row && settings_.element_dummy_buttons) {
+        const int x0 = main_total_w + 1;
+        if (m.x >= x0 && m.x < x0 + button_total_w) { play_relative(-1); return; }
+        if (m.x >= x0 + button_total_w && m.x < x0 + 2 * button_total_w) {
+            if (has_track_) { if (player_.is_paused()) player_.resume(); else player_.pause(); }
+            return;
+        }
+        if (m.x >= x0 + 2 * button_total_w && m.x < x0 + 3 * button_total_w) { play_relative(1); return; }
+    }
+
+    // Volume bar: only the strip between the square brackets is clickable;
+    // the "VOLUME BAR:" label and trailing "]" + "XX%" are ignored. The
+    // text is right-aligned in the side area exactly like build_progress_panel
+    // does, so the bracket content spans cols text_start+13 .. text_start+32
+    // (13-char prefix, 20-char bar).
+    if (m.y == volume_row) {
+        const int vol_now = player_.volume();
+        const int vol_hashes = (vol_now * 20) / 100;
+        const std::string vol_bar_text = std::string(vol_hashes, '#') + std::string(20 - vol_hashes, '-');
+        const int visible_w = display_width("VOLUME BAR:[" + vol_bar_text + "] " + std::to_string(vol_now) + "%");
+        const int side_w = W - main_total_w;
+        const int pad = std::max(0, side_w - visible_w);
+        const int text_start = main_total_w + 1 + pad; // 1-based col of the volume text
+        const int bar_x0 = text_start + 13;            // first bar cell inside "[...]"
+        const int bar_x1 = bar_x0 + 19;                // last bar cell inside "[...]"
+        if (m.x >= bar_x0 && m.x <= bar_x1 && has_track_) {
+            const double frac = static_cast<double>(m.x - bar_x0) / 19.0;
+            const int vol = static_cast<int>(std::round(frac * 100.0 / 5.0)) * 5;
+            player_.set_volume(std::clamp(vol, 0, 100));
+        }
+        return;
+    }
+
+    // Sound wave (progress bar): click seeks to the tapped position.
+    if (m.y >= wave_rows_lo && m.y <= wave_rows_hi) {
+        // Inner wave area spans cols 3 .. 3+wave_w-1 (| and a space on
+        // the left, a space and | on the right) for exactly wave_w cells.
+        const int x_lo = 3;
+        const int x_hi = std::max(x_lo, x_lo + wave_w - 1);
+        if (m.x >= x_lo && m.x <= x_hi && has_track_ && total_sec_ > 0) {
+            const double frac = static_cast<double>(m.x - x_lo) / static_cast<double>(x_hi - x_lo);
+            const double target = frac * static_cast<double>(total_sec_);
+            player_.seek_relative(target - player_.poll_elapsed());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Lazy metadata probing for whatever's currently visible in the list
 // ---------------------------------------------------------------------
 
@@ -2969,7 +3040,11 @@ int App::run() {
 
     while (!quit_) {
         int key = term.poll_key();
-        handle_key(key);
+        if (key == TerminalIO::kMouseEventCode) {
+            if (mode_ == Mode::Browse) handle_mouse(term.last_mouse(), term.cols());
+        } else {
+            handle_key(key);
+        }
 
         poll_pending_search();
         maybe_load_online_more();

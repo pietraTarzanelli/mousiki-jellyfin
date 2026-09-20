@@ -268,6 +268,7 @@ private:
     void queue_move_hovering(int dir); // dir=-1 up, +1 down
     void clamp_queue_selected();
     void handle_key(int key);
+    void handle_mouse(const MouseEvent& m, int term_cols);
     void ensure_visible_row_meta();
     void recompute_waveform_for_current_track();
     std::string render_frame(TerminalIO& term);

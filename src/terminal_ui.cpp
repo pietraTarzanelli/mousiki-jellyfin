@@ -13,6 +13,64 @@ namespace muisc {
 
 static struct termios g_orig_termios;
 
+// Reads one byte; returns false if nothing arrived.
+static bool read_byte(unsigned char& out) {
+    return read(STDIN_FILENO, &out, 1) == 1;
+}
+
+// Parses the SGR mouse payload already sitting after "ESC [ <": a series
+// of ';'-separated decimal fields terminated by 'M' (button press) or 'm'
+// (button release). Stores the decoded event and returns kMouseEventCode.
+// Wheel events (button with the 0x40 bit set) are stored but marked so the
+// app can ignore them — the wheel is deliberately blocked.
+int TerminalIO::parse_sgr_mouse(int first) {
+    int cb = first;
+    int coords[2] = {0, 0};
+    int field = 0;
+    unsigned char c = 0;
+    bool term_m = false; // 'M' = press, 'm' = release
+    while (read_byte(c)) {
+        if (c >= '0' && c <= '9') {
+            int* cur = (field == 0) ? &cb : ((field == 1) ? &coords[0] : &coords[1]);
+            *cur = *cur * 10 + (c - '0');
+        } else if (c == ';') {
+            ++field;
+        } else if (c == 'M' || c == 'm') {
+            term_m = (c == 'M');
+            break;
+        } else {
+            return 0; // malformed — drop the sequence
+        }
+        if (field > 2) return 0;
+    }
+    if (field != 2) return 0; // malformed — need exactly b;x;y
+    
+    // Release events are reported as SGR button code 3 with an 'm'
+    // terminator; normalize to the X10-style release value.
+    MouseEvent ev;
+    ev.button = cb;
+    if (!term_m) ev.button = 3;
+    ev.x = coords[0];
+    ev.y = coords[1];
+    last_mouse_ = ev;
+    return kMouseEventCode;
+}
+
+// Parses the X10 payload sitting right after "ESC [ M": three bytes,
+// each offset by +32 (button+32, x+32, y+32, 1-based).
+int TerminalIO::parse_x10_mouse() {
+    unsigned char data[3] = {0, 0, 0};
+    for (int i = 0; i < 3; ++i) {
+        if (!read_byte(data[i])) return 0; // truncated — drop the sequence
+    }
+    MouseEvent ev;
+    ev.button = static_cast<int>(data[0]) - 32;
+    ev.x = static_cast<int>(data[1]) - 32;
+    ev.y = static_cast<int>(data[2]) - 32;
+    last_mouse_ = ev;
+    return kMouseEventCode;
+}
+
 TerminalIO::TerminalIO() {
     struct termios raw;
     tcgetattr(STDIN_FILENO, &g_orig_termios);
@@ -22,7 +80,10 @@ TerminalIO::TerminalIO() {
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     raw_mode_active_ = true;
-    std::cout << "\x1b[?25l" << std::flush; // hide cursor
+    // Enable mouse reporting. Only button press/release (1000h) in the
+    // SGR extended encoding (1006h); no motion/drag mode, so the wheel
+    // arrives as button codes we simply ignore — the wheel is blocked.
+    std::cout << "\x1b[?1006h\x1b[?1000h" << "\x1b[?25l" << std::flush; // hide cursor + mouse tracking
 }
 
 TerminalIO::~TerminalIO() { restore(); }
@@ -30,7 +91,7 @@ TerminalIO::~TerminalIO() { restore(); }
 void TerminalIO::restore() {
     if (raw_mode_active_) {
         tcsetattr(STDIN_FILENO, TCSANOW, &g_orig_termios);
-        std::cout << "\x1b[?25h" << std::flush;
+        std::cout << "\x1b[?1000l\x1b[?1006l" << "\x1b[?25h" << std::flush;
         raw_mode_active_ = false;
     }
 }
@@ -62,10 +123,12 @@ int TerminalIO::poll_key() {
 
     if (c == '\x1b') {
         unsigned char seq[2] = {0, 0};
-        if (read(STDIN_FILENO, &seq[0], 1) != 1) return 27;
-        if (read(STDIN_FILENO, &seq[1], 1) != 1) return 27;
+        if (!read_byte(seq[0])) return 27;
+        if (!read_byte(seq[1])) return 27;
         if (seq[0] == '[') {
             switch (seq[1]) {
+                case 'M': return parse_x10_mouse(); // "ESC [ M cb cx cy"
+                case '<': return parse_sgr_mouse(0); // "ESC [ < b;x;y M/m"
                 case 'A': return 'A';
                 case 'B': return 'B';
                 case 'C': return 'C';
